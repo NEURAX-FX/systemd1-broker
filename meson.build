@@ -2435,6 +2435,7 @@ subdir('src/storagetm')
 subdir('src/sulogin-shell')
 subdir('src/sysctl')
 subdir('src/sysext')
+subdir('src/systemd1-broker')
 subdir('src/system-update-generator')
 subdir('src/systemctl')
 subdir('src/sysupdate')
@@ -2510,7 +2511,8 @@ foreach dict : executables
         foreach key, val : dict
                 if key in ['name', 'dbus', 'public', 'conditions', 'type', 'suite',
                            'timeout', 'parallel', 'objects', 'sources', 'extract',
-                           'include_directories', 'build_by_default', 'install']
+                           'include_directories', 'build_by_default', 'install',
+                           'test_depends']
                         continue
                 endif
 
@@ -2608,11 +2610,17 @@ foreach dict : executables
                 elif type == 'unsafe' and want_tests != 'unsafe'
                         message(f'@suite@/@name@ is an unsafe test')
                 elif dict.get('build_by_default')
+                        test_depends = []
+                        foreach dependency : dict.get('test_depends', [])
+                                test_depends += [executables_by_name[dependency]]
+                        endforeach
+
                         test(name, exe,
-                             env : test_env,
-                             timeout : dict.get('timeout', 30),
-                             suite : suite,
-                             is_parallel : dict.get('parallel', true))
+                              env : test_env,
+                              timeout : dict.get('timeout', 30),
+                              suite : suite,
+                              is_parallel : dict.get('parallel', true),
+                              depends : test_depends)
                 endif
         endif
 

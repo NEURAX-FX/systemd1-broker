@@ -458,6 +458,11 @@ executables += [
                 'dependencies' : libselinux_cflags,
         },
         test_template + {
+                'sources' : files('test-systemd1-broker.c') + systemd1_broker_sources,
+                'include_directories' : includes + include_directories('../systemd1-broker'),
+                'test_depends' : ['systemd1-broker'],
+        },
+        test_template + {
                 'sources' : files('test-set-disable-mempool.c'),
                 'dependencies' : threads,
         },
