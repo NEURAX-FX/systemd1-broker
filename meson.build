@@ -2512,7 +2512,7 @@ foreach dict : executables
                 if key in ['name', 'dbus', 'public', 'conditions', 'type', 'suite',
                            'timeout', 'parallel', 'objects', 'sources', 'extract',
                            'include_directories', 'build_by_default', 'install',
-                           'test_depends']
+                           'test_depends', 'test_depends_targets']
                         continue
                 endif
 
@@ -2610,7 +2610,7 @@ foreach dict : executables
                 elif type == 'unsafe' and want_tests != 'unsafe'
                         message(f'@suite@/@name@ is an unsafe test')
                 elif dict.get('build_by_default')
-                        test_depends = []
+                        test_depends = dict.get('test_depends_targets', [])
                         foreach dependency : dict.get('test_depends', [])
                                 test_depends += [executables_by_name[dependency]]
                         endforeach

@@ -1,12 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <pthread.h>
+#include <dlfcn.h>
 #include <sys/socket.h>
 
 #include "sd-bus.h"
 
 #include "alloc-util.h"
 #include "bus-internal.h"
+#include "dlfcn-util.h"
 #include "fd-util.h"
 #include "path-util.h"
 #include "pidref.h"
@@ -15,6 +17,7 @@
 #include "socket-util.h"
 #include "stat-util.h"
 #include "strv.h"
+#include "systemd1-broker-backend-api.h"
 #include "systemd1-broker-bus.h"
 #include "systemd1-broker-dbus.h"
 #include "systemd1-broker.h"
@@ -86,6 +89,57 @@ static JobRemovedSignal* job_removed_signal_done(JobRemovedSignal *signal) {
 }
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(JobRemovedSignal*, job_removed_signal_done);
+
+typedef struct TestBackendContext {
+        unsigned status_calls;
+        unsigned start_calls;
+        unsigned stop_calls;
+        const char *last_unit_name;
+        Systemd1BrokerBackendState status_state;
+} TestBackendContext;
+
+static int test_backend_status(
+                void *userdata,
+                const char *unit_name,
+                const Systemd1BrokerBackendUnitExtra *extra,
+                Systemd1BrokerBackendState *ret_state) {
+
+        TestBackendContext *context = ASSERT_PTR(userdata);
+
+        ASSERT_NOT_NULL(unit_name);
+        ASSERT_NOT_NULL(extra);
+        ASSERT_EQ(extra->size, sizeof(Systemd1BrokerBackendUnitExtra));
+        ASSERT_NOT_NULL(ret_state);
+
+        context->status_calls++;
+        context->last_unit_name = unit_name;
+        *ret_state = context->status_state;
+        return 0;
+}
+
+static int test_backend_start(void *userdata, const char *unit_name, const Systemd1BrokerBackendUnitExtra *extra) {
+        TestBackendContext *context = ASSERT_PTR(userdata);
+
+        ASSERT_NOT_NULL(unit_name);
+        ASSERT_NOT_NULL(extra);
+        ASSERT_EQ(extra->size, sizeof(Systemd1BrokerBackendUnitExtra));
+
+        context->start_calls++;
+        context->last_unit_name = unit_name;
+        return 0;
+}
+
+static int test_backend_stop(void *userdata, const char *unit_name, const Systemd1BrokerBackendUnitExtra *extra) {
+        TestBackendContext *context = ASSERT_PTR(userdata);
+
+        ASSERT_NOT_NULL(unit_name);
+        ASSERT_NOT_NULL(extra);
+        ASSERT_EQ(extra->size, sizeof(Systemd1BrokerBackendUnitExtra));
+
+        context->stop_calls++;
+        context->last_unit_name = unit_name;
+        return 0;
+}
 
 static int match_job_new(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
         JobNewSignal *signal = ASSERT_PTR(userdata);
@@ -473,6 +527,15 @@ static int broker_bus_test_client(BrokerBusTestContext *context) {
         ASSERT_OK(sd_bus_message_read(reply, "s", &introspection));
         ASSERT_TRUE(strstr(introspection, "interface name=\"org.freedesktop.systemd1.Job\""));
 
+        reply = sd_bus_message_unref(reply);
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "GetJob", &error, &reply, "u", UINT32_C(1)));
+        ASSERT_OK(sd_bus_message_read(reply, "o", &job_path));
+        ASSERT_STREQ(job_path, "/org/freedesktop/systemd1/job/1");
+
+        reply = sd_bus_message_unref(reply);
+        ASSERT_ERROR(sd_bus_call_method(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "CancelJob", &error, &reply, "u", UINT32_C(1)), EOPNOTSUPP);
+        sd_bus_error_free(&error);
+
         unit_properties_changed_signal_done(&unit_properties_changed);
         unit_properties_changed.job_id = UINT32_MAX;
 
@@ -514,6 +577,11 @@ static int broker_bus_test_client(BrokerBusTestContext *context) {
         ASSERT_STREQ(job_new.unit, "alpha.service");
         ASSERT_EQ(unit_properties_changed.job_id, 2u);
         ASSERT_STREQ(unit_properties_changed.job_path, "/org/freedesktop/systemd1/job/2");
+
+        reply = sd_bus_message_unref(reply);
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "Reload", &error, NULL, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "ResetFailed", &error, NULL, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "ResetFailedUnit", &error, NULL, "s", "alpha.service"));
 
         ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "Unsubscribe", &error, NULL, NULL));
 
@@ -564,7 +632,7 @@ static int broker_bus_test_client(BrokerBusTestContext *context) {
         ASSERT_OK(sd_bus_message_exit_container(reply));
 
         reply = sd_bus_message_unref(reply);
-        ASSERT_ERROR(sd_bus_call_method(
+        ASSERT_OK(sd_bus_call_method(
                         bus,
                         "org.freedesktop.systemd1",
                         "/org/freedesktop/systemd1",
@@ -574,8 +642,11 @@ static int broker_bus_test_client(BrokerBusTestContext *context) {
                         &reply,
                         "ss",
                         "alpha.service",
-                        "replace"), EOPNOTSUPP);
-        sd_bus_error_free(&error);
+                        "replace"));
+        ASSERT_OK(sd_bus_message_read(reply, "o", &job_path));
+        ASSERT_STREQ(job_path, "/org/freedesktop/systemd1/job/3");
+
+        ASSERT_OK(systemd1_broker_manager_complete_job(context->manager, 3));
 
         reply = sd_bus_message_unref(reply);
         ASSERT_OK(sd_bus_call_method(
@@ -590,7 +661,24 @@ static int broker_bus_test_client(BrokerBusTestContext *context) {
                         "alpha.service",
                         "replace"));
         ASSERT_OK(sd_bus_message_read(reply, "o", &job_path));
-        ASSERT_STREQ(job_path, "/org/freedesktop/systemd1/job/3");
+        ASSERT_STREQ(job_path, "/org/freedesktop/systemd1/job/4");
+
+        ASSERT_OK(systemd1_broker_manager_complete_job(context->manager, 4));
+
+        reply = sd_bus_message_unref(reply);
+        ASSERT_OK(sd_bus_call_method(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager",
+                        "ReloadOrRestartUnit",
+                        &error,
+                        &reply,
+                        "ss",
+                        "alpha.service",
+                        "replace"));
+        ASSERT_OK(sd_bus_message_read(reply, "o", &job_path));
+        ASSERT_STREQ(job_path, "/org/freedesktop/systemd1/job/5");
 
         reply = sd_bus_message_unref(reply);
         ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/alpha_2eservice", "org.freedesktop.DBus.Properties", "GetAll", &error, &reply, "s", "org.freedesktop.systemd1.Unit"));
@@ -627,8 +715,8 @@ static int broker_bus_test_client(BrokerBusTestContext *context) {
                 } else if (streq(property, "Job")) {
                         ASSERT_OK(sd_bus_message_enter_container(reply, 'v', "(uo)"));
                         ASSERT_OK(sd_bus_message_read(reply, "(uo)", &job_id, &job_path));
-                        ASSERT_EQ(job_id, 3u);
-                        ASSERT_STREQ(job_path, "/org/freedesktop/systemd1/job/3");
+                        ASSERT_EQ(job_id, 5u);
+                        ASSERT_STREQ(job_path, "/org/freedesktop/systemd1/job/5");
                         ASSERT_OK(sd_bus_message_exit_container(reply));
                         found_job = true;
                 } else
@@ -836,6 +924,95 @@ TEST_RET(executable_socket_smoke) {
         return EXIT_SUCCESS;
 }
 
+TEST_RET(executable_bus_address_smoke) {
+        _cleanup_(pidref_done_sigkill_wait) PidRef bus_daemon = PIDREF_NULL, broker = PIDREF_NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *tmpdir = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        const char *build_root, *broker_path, *socket_path, *bus_socket_path, *bus_address, *path;
+        siginfo_t si;
+        int r;
+
+        build_root = getenv("PROJECT_BUILD_ROOT");
+        if (!build_root)
+                return log_tests_skipped("PROJECT_BUILD_ROOT is not set");
+
+        broker_path = strjoina(build_root, "/systemd1-broker");
+        if (access(broker_path, X_OK) < 0)
+                return log_tests_skipped_errno(errno, "%s is not executable", broker_path);
+
+        if (access("/usr/bin/dbus-daemon", X_OK) < 0)
+                return log_tests_skipped_errno(errno, "/usr/bin/dbus-daemon is not executable");
+
+        ASSERT_OK(mkdtemp_malloc(NULL, &tmpdir));
+        socket_path = strjoina(tmpdir, "/broker.sock");
+        bus_socket_path = strjoina(tmpdir, "/bus.sock");
+        bus_address = strjoina("unix:path=", bus_socket_path);
+
+        r = ASSERT_OK(pidref_safe_fork("(dbus-daemon)", FORK_DEATHSIG_SIGKILL|FORK_LOG, &bus_daemon));
+        if (r == 0) {
+                const char *address_arg = strjoina("--address=", bus_address);
+
+                execl("/usr/bin/dbus-daemon", "dbus-daemon", "--session", address_arg, "--nofork", "--nopidfile", NULL);
+                _exit(EXIT_FAILURE);
+        }
+
+        for (unsigned i = 0; i < 200; i++) {
+                r = is_socket(bus_socket_path);
+                if (r > 0)
+                        break;
+                if (r < 0 && r != -ENOENT)
+                        return r;
+
+                usleep_safe(10 * USEC_PER_MSEC);
+        }
+        ASSERT_OK_POSITIVE(is_socket(bus_socket_path));
+
+        r = ASSERT_OK(pidref_safe_fork("(systemd1-broker)", FORK_DEATHSIG_SIGKILL|FORK_LOG, &broker));
+        if (r == 0) {
+                const char *socket_arg = strjoina("--socket=", socket_path);
+                const char *bus_address_arg = strjoina("--bus-address=", bus_address);
+
+                execl(broker_path, "systemd1-broker", socket_arg, bus_address_arg, NULL);
+                _exit(EXIT_FAILURE);
+        }
+
+        for (unsigned i = 0; i < 200; i++) {
+                r = is_socket(socket_path);
+                if (r > 0)
+                        break;
+                if (r < 0 && r != -ENOENT)
+                        return r;
+
+                usleep_safe(10 * USEC_PER_MSEC);
+        }
+        ASSERT_OK_POSITIVE(is_socket(socket_path));
+
+        ASSERT_OK(sd_bus_new(&bus));
+        ASSERT_OK(sd_bus_set_address(bus, bus_address));
+        ASSERT_OK(sd_bus_set_bus_client(bus, true));
+        ASSERT_OK(sd_bus_start(bus));
+
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "GetUnit", &error, &reply, "s", "alpha.service"));
+        ASSERT_OK(sd_bus_message_read(reply, "o", &path));
+        ASSERT_STREQ(path, "/org/freedesktop/systemd1/unit/alpha_2eservice");
+
+        ASSERT_OK(pidref_kill(&broker, SIGTERM));
+        ASSERT_OK(pidref_wait_for_terminate(&broker, &si));
+        ASSERT_EQ(si.si_code, CLD_KILLED);
+        ASSERT_EQ(si.si_status, SIGTERM);
+        pidref_done(&broker);
+
+        ASSERT_OK(pidref_kill(&bus_daemon, SIGTERM));
+        ASSERT_OK(pidref_wait_for_terminate(&bus_daemon, &si));
+        ASSERT_EQ(si.si_code, CLD_EXITED);
+        ASSERT_EQ(si.si_status, EXIT_SUCCESS);
+        pidref_done(&bus_daemon);
+
+        return EXIT_SUCCESS;
+}
+
 TEST(job_path) {
         _cleanup_free_ char *path = NULL;
 
@@ -857,9 +1034,6 @@ TEST(backend_state_to_unit_state) {
 
         ASSERT_STREQ(systemd1_broker_backend_state_to_active_state(SYSTEMD1_BROKER_BACKEND_RUNNING), "active");
         ASSERT_STREQ(systemd1_broker_backend_state_to_sub_state(SYSTEMD1_BROKER_BACKEND_RUNNING), "running");
-
-        ASSERT_STREQ(systemd1_broker_backend_state_to_active_state(SYSTEMD1_BROKER_BACKEND_RELOADING), "reloading");
-        ASSERT_STREQ(systemd1_broker_backend_state_to_sub_state(SYSTEMD1_BROKER_BACKEND_RELOADING), "reload");
 
         ASSERT_STREQ(systemd1_broker_backend_state_to_active_state(SYSTEMD1_BROKER_BACKEND_STOPPING), "deactivating");
         ASSERT_STREQ(systemd1_broker_backend_state_to_sub_state(SYSTEMD1_BROKER_BACKEND_STOPPING), "stop");
@@ -1209,11 +1383,30 @@ TEST(manager_start_stop_restart_operations) {
         _cleanup_(systemd1_broker_manager_freep) Systemd1BrokerManager *manager = NULL;
         Systemd1BrokerJobInfo job_info = {};
         Systemd1BrokerUnitInfo unit_info = {};
+        TestBackendContext backend_context = {
+                .status_state = SYSTEMD1_BROKER_BACKEND_RUNNING,
+        };
+        const Systemd1BrokerBackendOps backend_ops = {
+                .size = sizeof(Systemd1BrokerBackendOps),
+                .userdata = &backend_context,
+                .status = test_backend_status,
+                .start = test_backend_start,
+                .stop = test_backend_stop,
+        };
 
         ASSERT_OK(systemd1_broker_manager_new(&manager));
+        ASSERT_OK(systemd1_broker_manager_set_backend(manager, &backend_ops));
         ASSERT_OK(systemd1_broker_manager_add_unit(manager, "alpha.service", "Alpha", NULL));
 
+        ASSERT_OK(systemd1_broker_manager_refresh_unit_status(manager, "alpha.service"));
+        ASSERT_EQ(backend_context.status_calls, 1u);
+        ASSERT_STREQ(backend_context.last_unit_name, "alpha.service");
+        ASSERT_OK(systemd1_broker_manager_get_unit_info(manager, "alpha.service", &unit_info));
+        ASSERT_STREQ(unit_info.active_state, "active");
+        ASSERT_STREQ(unit_info.sub_state, "running");
+
         ASSERT_OK(systemd1_broker_manager_start_unit(manager, "alpha.service", "replace", NULL));
+        ASSERT_EQ(backend_context.start_calls, 1u);
         ASSERT_OK(systemd1_broker_manager_job_info_at(manager, 0, &job_info));
         ASSERT_STREQ(job_info.job_type, "start");
         ASSERT_OK(systemd1_broker_manager_complete_job(manager, job_info.id));
@@ -1223,6 +1416,7 @@ TEST(manager_start_stop_restart_operations) {
         ASSERT_EQ(systemd1_broker_manager_n_jobs(manager), 0u);
 
         ASSERT_OK(systemd1_broker_manager_stop_unit(manager, "alpha.service", "replace", NULL));
+        ASSERT_EQ(backend_context.stop_calls, 1u);
         ASSERT_OK(systemd1_broker_manager_job_info_at(manager, 0, &job_info));
         ASSERT_STREQ(job_info.job_type, "stop");
         ASSERT_OK(systemd1_broker_manager_complete_job(manager, job_info.id));
@@ -1231,6 +1425,8 @@ TEST(manager_start_stop_restart_operations) {
         ASSERT_STREQ(unit_info.sub_state, "dead");
 
         ASSERT_OK(systemd1_broker_manager_restart_unit(manager, "alpha.service", "replace", NULL));
+        ASSERT_EQ(backend_context.stop_calls, 2u);
+        ASSERT_EQ(backend_context.start_calls, 2u);
         ASSERT_OK(systemd1_broker_manager_job_info_at(manager, 0, &job_info));
         ASSERT_STREQ(job_info.job_type, "restart");
         ASSERT_OK(systemd1_broker_manager_complete_job(manager, job_info.id));
@@ -1256,12 +1452,28 @@ TEST(manager_operation_modes_and_conflicts) {
 TEST(manager_reload_and_try_restart_operations) {
         _cleanup_(systemd1_broker_manager_freep) Systemd1BrokerManager *manager = NULL;
         Systemd1BrokerJobInfo job_info = {};
+        TestBackendContext backend_context = {
+                .status_state = SYSTEMD1_BROKER_BACKEND_RUNNING,
+        };
+        const Systemd1BrokerBackendOps backend_ops = {
+                .size = sizeof(Systemd1BrokerBackendOps),
+                .userdata = &backend_context,
+                .status = test_backend_status,
+                .start = test_backend_start,
+                .stop = test_backend_stop,
+        };
         Systemd1BrokerUnit *unit;
 
         ASSERT_OK(systemd1_broker_manager_new(&manager));
+        ASSERT_OK(systemd1_broker_manager_set_backend(manager, &backend_ops));
         ASSERT_OK(systemd1_broker_manager_add_unit(manager, "alpha.service", "Alpha", &unit));
 
-        ASSERT_ERROR(systemd1_broker_manager_reload_unit(manager, "alpha.service", "replace", NULL), EOPNOTSUPP);
+        ASSERT_OK(systemd1_broker_manager_reload_unit(manager, "alpha.service", "replace", NULL));
+        ASSERT_EQ(backend_context.start_calls, 0u);
+        ASSERT_EQ(backend_context.stop_calls, 0u);
+        ASSERT_OK(systemd1_broker_manager_job_info_at(manager, 0, &job_info));
+        ASSERT_STREQ(job_info.job_type, "reload");
+        ASSERT_OK(systemd1_broker_manager_complete_job(manager, job_info.id));
 
         ASSERT_OK(systemd1_broker_manager_try_restart_unit(manager, "alpha.service", "replace", NULL));
         ASSERT_EQ(systemd1_broker_manager_n_jobs(manager), 0u);
@@ -1271,6 +1483,33 @@ TEST(manager_reload_and_try_restart_operations) {
         ASSERT_EQ(systemd1_broker_manager_n_jobs(manager), 1u);
         ASSERT_OK(systemd1_broker_manager_job_info_at(manager, 0, &job_info));
         ASSERT_STREQ(job_info.job_type, "restart");
+        ASSERT_EQ(backend_context.stop_calls, 1u);
+        ASSERT_EQ(backend_context.start_calls, 1u);
+}
+
+TEST(servicectl_backend_library_exports_abi) {
+        _cleanup_(dlclosep) void *dl = NULL;
+        const char *build_root, *library_path;
+        const Systemd1BrokerBackendOps* (*entrypoint)(void);
+        const Systemd1BrokerBackendOps *ops;
+
+        build_root = getenv("PROJECT_BUILD_ROOT");
+        if (!build_root)
+                return (void) log_tests_skipped("PROJECT_BUILD_ROOT is not set");
+
+        library_path = strjoina(build_root, "/src/systemd1-broker/libsystemd1-broker-backend-servicectl.so");
+        dl = dlopen(library_path, RTLD_NOW|RTLD_LOCAL);
+        ASSERT_NOT_NULL(dl);
+
+        entrypoint = (typeof(entrypoint)) dlsym(dl, "systemd1_broker_backend_get_ops");
+        ASSERT_NOT_NULL(entrypoint);
+
+        ops = ASSERT_PTR(entrypoint());
+        ASSERT_EQ(ops->size, sizeof(Systemd1BrokerBackendOps));
+        ASSERT_NOT_NULL(ops->status);
+        ASSERT_NOT_NULL(ops->start);
+        ASSERT_NOT_NULL(ops->stop);
+        ASSERT_NULL(dlsym(dl, "sd_bus_open_system"));
 }
 
 TEST(bus_append_unit_info) {

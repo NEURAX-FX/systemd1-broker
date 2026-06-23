@@ -87,8 +87,9 @@ The broker has four layers:
    with systemd-compatible signatures.
 3. **State model:** Stores normalized units, jobs, dependencies, and install
    metadata independent of any backend.
-4. **Backend adapter:** Starts, stops, restarts, reloads, and queries services
-   through the selected service manager.
+4. **Backend adapter:** Starts, stops, and queries one service at a time through
+   the selected service manager. The broker composes restart and reload
+   compatibility itself.
 
 The D-Bus facade must not leak backend-specific state. Backend-specific states
 are mapped into systemd-compatible `LoadState`, `ActiveState`, `SubState`,
@@ -107,20 +108,23 @@ exercise the object model without a real service-manager backend:
 3. A minimal sd-bus facade for Manager `GetUnit()`, `LoadUnit()`, `ListUnits()`,
    `ListUnitsFiltered()`, `ListUnitsByNames()`, `ListUnitsByPatterns()`,
    `ListJobs()`, `StartUnit()`, `StopUnit()`, `ReloadUnit()`, `RestartUnit()`,
-   `TryRestartUnit()`, `Subscribe()`, and `Unsubscribe()`.
+   `TryRestartUnit()`, `ReloadOrRestartUnit()`, `GetJob()`, `CancelJob()`,
+   `ResetFailedUnit()`, `ResetFailed()`, `Reload()`, `Subscribe()`, and
+   `Unsubscribe()`.
 4. Minimal Manager, Unit, Service, and Job object vtables, including `GetAll()`
    coverage for the supported neutral property values.
 5. `JobNew` signal emission when D-Bus operations create jobs, plus `JobRemoved`
    and Unit `PropertiesChanged` signal emission when a controlled test operation
    completes a fake broker job.
-6. A `systemd1-broker --socket=PATH` test executable that seeds `alpha.service`
-   and serves direct sd-bus clients over a Unix stream socket.
+6. A `systemd1-broker --socket=PATH [--bus-address=ADDR]` test executable that
+   seeds `alpha.service`, serves direct sd-bus clients over a Unix stream socket,
+   and can own `org.freedesktop.systemd1` on a supplied D-Bus bus address.
 
-The prototype intentionally does not yet implement bus-name ownership, system or
-user private socket path management, reload-capable backend operations,
-unit-file indexing, install-state metadata, authorization policy, automatic
-backend-driven job completion and state-change signal emission, or a real backend
-adapter.
+The prototype intentionally does not yet implement automatic system or user bus
+discovery, default system or user private socket path management, job
+cancellation, unit-file indexing, install-state metadata, authorization policy,
+automatic backend-driven job completion and state-change signal emission, or a
+real backend adapter.
 
 ## Transport Requirements
 
@@ -135,7 +139,9 @@ and it must fail clearly if another manager already owns the socket.
 
 The broker may also connect to the system or user bus and request
 `org.freedesktop.systemd1`. This is required for clients that do not use the
-private socket path.
+private socket path. The current prototype exposes this through an explicit
+`--bus-address=ADDR` test/development option rather than auto-discovering the
+system or user bus address.
 
 ## D-Bus Surface: Manager
 
@@ -151,9 +157,9 @@ The first implementation supports this subset of
 | `StartUnit(s name, s mode)` | method | Create a start job and return its object path. |
 | `StopUnit(s name, s mode)` | method | Create a stop job and return its object path. |
 | `RestartUnit(s name, s mode)` | method | Create a restart job and return its object path. |
-| `ReloadUnit(s name, s mode)` | method | Create a reload job when the backend supports reload. |
+| `ReloadUnit(s name, s mode)` | method | Refresh broker metadata and return a broker-local reload job. |
 | `TryRestartUnit(s name, s mode)` | method | Restart only active units. |
-| `ReloadOrRestartUnit(s name, s mode)` | method | Prefer reload if available, otherwise restart. |
+| `ReloadOrRestartUnit(s name, s mode)` | method | Use broker-local reload when sufficient, otherwise broker-composed restart. |
 | `ListJobs()` | method | Return active broker jobs using the systemd tuple shape. |
 | `Subscribe()` | method | Enable compatibility signal delivery for the connection. |
 | `Unsubscribe()` | method | Disable compatibility signal delivery for the connection. |
@@ -388,20 +394,27 @@ refresh path.
 ## Backend Adapter
 
 The backend adapter is the only layer that knows how to control the real service
-manager. Its contract is:
+manager. It intentionally has a narrow init-neutral contract; see
+`docs/superpowers/specs/2026-06-22-systemd1-broker-backend-design.md` for the
+full backend design. Its contract is:
 
 1. Enumerate known services and their current state.
 2. Resolve a unit name to a backend service id.
-3. Start, stop, restart, and optionally reload a service.
+3. Query, start, and stop one resolved service.
 4. Report operation completion asynchronously.
 5. Report service state changes independently of broker-initiated jobs.
 6. Provide optional metadata such as description, dependencies, enabled state,
    process id, invocation id, and failure reason.
 
 Each backend adapter advertises capabilities before it is used. The minimum
-capability set is `enumerate`, `query-state`, `start`, `stop`, and `restart`.
-Optional capabilities include `reload`, `cancel`, `reset-failed`, `main-pid`,
-`invocation-id`, `enabled-state`, `dependencies`, and `journal-cursor`.
+capability set is `enumerate`, `query-state`, `start`, and `stop`. Optional
+capabilities include `cancel`, `reset-failed`, `main-pid`, `invocation-id`,
+`enabled-state`, `dependencies`, and `journal-cursor`.
+
+The broker computes dependency order and decomposes high-level compatibility
+operations. `RestartUnit()` becomes backend `stop` followed by backend `start`;
+`ReloadUnit()` refreshes broker metadata and status snapshots without requiring a
+backend reload operation.
 
 Backend operations are asynchronous from the facade's point of view. An adapter
 operation returns either an immediate error before a Job is exposed, or an
@@ -437,14 +450,14 @@ Backend state is mapped to systemd-compatible Unit state strings:
 | Unknown or absent | `inactive` | `dead` |
 | Starting | `activating` | `start` |
 | Running | `active` | `running` |
-| Reloading | `reloading` | `reload` |
 | Stopping | `deactivating` | `stop` |
 | Stopped cleanly | `inactive` | `dead` |
 | Failed | `failed` | `failed` |
 
-If a backend has richer state than this table, the adapter may provide a more
-specific `SubState` as long as `ActiveState` remains one of the common systemd
-states.
+The core backend state model has no reload state. The D-Bus facade may synthesize
+temporary `reloading`/`reload` values only for a broker-local reload job. If a
+backend has richer state than this table, the adapter may provide a more specific
+`SubState` as long as `ActiveState` remains one of the common systemd states.
 
 ## Error Mapping
 
@@ -511,8 +524,8 @@ service-management logic to live outside systemd.
 
 ### Phase 2: Mutating Jobs
 
-1. Implement `StartUnit()`, `StopUnit()`, `RestartUnit()`, `ReloadUnit()`, and the
-   matching Unit methods.
+1. Implement `StartUnit()`, `StopUnit()`, broker-composed `RestartUnit()`,
+   broker-local `ReloadUnit()`, and the matching Unit methods.
 2. Add Job objects and monotonically increasing job ids.
 3. Emit `JobNew`, `JobRemoved`, and Unit `PropertiesChanged`.
 4. Verify `systemctl start UNIT`, `systemctl stop UNIT`, `systemctl restart UNIT`,

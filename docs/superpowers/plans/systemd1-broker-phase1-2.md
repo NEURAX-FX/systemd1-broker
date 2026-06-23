@@ -195,8 +195,8 @@ Tests first:
    Unit `Job` field.
 2. `StopUnit(name, "replace")` creates a `stop` job.
 3. `RestartUnit(name, "replace")` creates a `restart` job.
-4. `ReloadUnit(name, "replace")` returns `-EOPNOTSUPP` until a reload-capable
-   backend exists, unless a neutral reload job is intentionally supported.
+4. `ReloadUnit(name, "replace")` completes a broker-local reload job without
+   invoking backend operations.
 5. `TryRestartUnit()` returns no job for inactive units and creates a restart job
    for active units.
 6. Unsupported modes return `-EOPNOTSUPP`.

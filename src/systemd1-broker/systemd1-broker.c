@@ -3,6 +3,9 @@
 #include <stdio.h>
 
 #include "alloc-util.h"
+#include "dlfcn-util.h"
+#include "errno-util.h"
+#include "log.h"
 #include "string-util.h"
 #include "strv.h"
 #include "systemd1-broker.h"
@@ -24,6 +27,8 @@ struct Systemd1BrokerManager {
         Systemd1BrokerJob **jobs;
         size_t n_jobs;
         uint32_t next_job_id;
+        void *backend_dl;
+        Systemd1BrokerBackendOps backend_ops;
 };
 
 struct Systemd1BrokerJob {
@@ -63,13 +68,12 @@ int systemd1_broker_job_path(uint32_t id, char **ret) {
 
 const char* systemd1_broker_backend_state_to_active_state(Systemd1BrokerBackendState state) {
         static const char *const table[_SYSTEMD1_BROKER_BACKEND_STATE_MAX] = {
-                [SYSTEMD1_BROKER_BACKEND_ABSENT]    = "inactive",
-                [SYSTEMD1_BROKER_BACKEND_STARTING]  = "activating",
-                [SYSTEMD1_BROKER_BACKEND_RUNNING]   = "active",
-                [SYSTEMD1_BROKER_BACKEND_RELOADING] = "reloading",
-                [SYSTEMD1_BROKER_BACKEND_STOPPING]  = "deactivating",
-                [SYSTEMD1_BROKER_BACKEND_STOPPED]   = "inactive",
-                [SYSTEMD1_BROKER_BACKEND_FAILED]    = "failed",
+                [SYSTEMD1_BROKER_BACKEND_ABSENT]   = "inactive",
+                [SYSTEMD1_BROKER_BACKEND_STARTING] = "activating",
+                [SYSTEMD1_BROKER_BACKEND_RUNNING]  = "active",
+                [SYSTEMD1_BROKER_BACKEND_STOPPING] = "deactivating",
+                [SYSTEMD1_BROKER_BACKEND_STOPPED]  = "inactive",
+                [SYSTEMD1_BROKER_BACKEND_FAILED]   = "failed",
         };
 
         if (state < 0 || state >= _SYSTEMD1_BROKER_BACKEND_STATE_MAX)
@@ -80,13 +84,12 @@ const char* systemd1_broker_backend_state_to_active_state(Systemd1BrokerBackendS
 
 const char* systemd1_broker_backend_state_to_sub_state(Systemd1BrokerBackendState state) {
         static const char *const table[_SYSTEMD1_BROKER_BACKEND_STATE_MAX] = {
-                [SYSTEMD1_BROKER_BACKEND_ABSENT]    = "dead",
-                [SYSTEMD1_BROKER_BACKEND_STARTING]  = "start",
-                [SYSTEMD1_BROKER_BACKEND_RUNNING]   = "running",
-                [SYSTEMD1_BROKER_BACKEND_RELOADING] = "reload",
-                [SYSTEMD1_BROKER_BACKEND_STOPPING]  = "stop",
-                [SYSTEMD1_BROKER_BACKEND_STOPPED]   = "dead",
-                [SYSTEMD1_BROKER_BACKEND_FAILED]    = "failed",
+                [SYSTEMD1_BROKER_BACKEND_ABSENT]   = "dead",
+                [SYSTEMD1_BROKER_BACKEND_STARTING] = "start",
+                [SYSTEMD1_BROKER_BACKEND_RUNNING]  = "running",
+                [SYSTEMD1_BROKER_BACKEND_STOPPING] = "stop",
+                [SYSTEMD1_BROKER_BACKEND_STOPPED]  = "dead",
+                [SYSTEMD1_BROKER_BACKEND_FAILED]   = "failed",
         };
 
         if (state < 0 || state >= _SYSTEMD1_BROKER_BACKEND_STATE_MAX)
@@ -105,6 +108,7 @@ Systemd1BrokerManager* systemd1_broker_manager_free(Systemd1BrokerManager *manag
         for (size_t i = 0; i < manager->n_jobs; i++)
                 systemd1_broker_job_free(manager->jobs[i]);
 
+        safe_dlclose(manager->backend_dl);
         free(manager->units);
         free(manager->jobs);
 
@@ -123,6 +127,54 @@ int systemd1_broker_manager_new(Systemd1BrokerManager **ret) {
         manager->next_job_id = 1;
 
         *ret = manager;
+        return 0;
+}
+
+static int systemd1_broker_backend_ops_verify(const Systemd1BrokerBackendOps *ops) {
+        if (!ops || ops->size < sizeof(Systemd1BrokerBackendOps) || !ops->status || !ops->start || !ops->stop)
+                return -EINVAL;
+
+        return 0;
+}
+
+int systemd1_broker_manager_set_backend(Systemd1BrokerManager *manager, const Systemd1BrokerBackendOps *ops) {
+        int r;
+
+        assert(manager);
+
+        r = systemd1_broker_backend_ops_verify(ops);
+        if (r < 0)
+                return r;
+
+        manager->backend_ops = *ops;
+        return 0;
+}
+
+int systemd1_broker_manager_load_backend(Systemd1BrokerManager *manager, const char *path) {
+        _cleanup_(dlclosep) void *dl = NULL;
+        Systemd1BrokerBackendGetOps get_ops;
+        const Systemd1BrokerBackendOps *ops;
+        const char *dle = NULL;
+        int r;
+
+        assert(manager);
+        assert(path);
+
+        r = dlopen_safe(path, &dl, &dle);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to load systemd1 broker backend '%s': %s", path, dle ?: STRERROR(r));
+
+        get_ops = (Systemd1BrokerBackendGetOps) dlsym(dl, SYSTEMD1_BROKER_BACKEND_GET_OPS_SYMBOL);
+        if (!get_ops)
+                return log_debug_errno(SYNTHETIC_ERRNO(ELIBBAD), "Backend '%s' does not export %s: %s", path, SYSTEMD1_BROKER_BACKEND_GET_OPS_SYMBOL, dlerror());
+
+        ops = get_ops();
+        r = systemd1_broker_manager_set_backend(manager, ops);
+        if (r < 0)
+                return r;
+
+        safe_dlclose(manager->backend_dl);
+        manager->backend_dl = TAKE_PTR(dl);
         return 0;
 }
 
@@ -307,6 +359,40 @@ int systemd1_broker_manager_load_unit_path(Systemd1BrokerManager *manager, const
         return systemd1_broker_manager_get_unit_path(manager, name, ret);
 }
 
+static Systemd1BrokerBackendUnitExtra systemd1_broker_unit_backend_extra(Systemd1BrokerUnit *unit) {
+        assert(unit);
+
+        return (Systemd1BrokerBackendUnitExtra) {
+                .size = sizeof(Systemd1BrokerBackendUnitExtra),
+                .id = unit->name,
+                .description = unit->description,
+        };
+}
+
+int systemd1_broker_manager_refresh_unit_status(Systemd1BrokerManager *manager, const char *name) {
+        Systemd1BrokerBackendUnitExtra extra;
+        Systemd1BrokerBackendState state;
+        Systemd1BrokerUnit *unit;
+        int r;
+
+        assert(manager);
+        assert(name);
+
+        unit = systemd1_broker_manager_get_unit(manager, name);
+        if (!unit)
+                return -ENOENT;
+
+        if (!manager->backend_ops.status)
+                return 0;
+
+        extra = systemd1_broker_unit_backend_extra(unit);
+        r = manager->backend_ops.status(manager->backend_ops.userdata, unit->name, &extra, &state);
+        if (r < 0)
+                return r;
+
+        return systemd1_broker_unit_set_backend_state(unit, state);
+}
+
 int systemd1_broker_manager_add_job(Systemd1BrokerManager *manager, const char *unit_name, const char *job_type, Systemd1BrokerJob **ret) {
         assert(manager);
         assert(unit_name);
@@ -373,31 +459,95 @@ static int systemd1_broker_manager_validate_job_mode(const char *mode) {
         return -EOPNOTSUPP;
 }
 
-static int systemd1_broker_manager_add_operation(Systemd1BrokerManager *manager, const char *unit_name, const char *mode, const char *job_type, Systemd1BrokerBackendState final_state, Systemd1BrokerJob **ret) {
+static int systemd1_broker_manager_prepare_operation(Systemd1BrokerManager *manager, const char *unit_name, const char *mode) {
+        Systemd1BrokerUnit *unit;
         int r;
 
         assert(manager);
         assert(unit_name);
         assert(mode);
-        assert(job_type);
 
         r = systemd1_broker_manager_validate_job_mode(mode);
         if (r < 0)
                 return r;
 
-        return systemd1_broker_manager_add_job_internal(manager, unit_name, job_type, final_state, ret);
+        unit = systemd1_broker_manager_get_unit(manager, unit_name);
+        if (!unit)
+                return -ENOENT;
+        if (unit->job)
+                return -EBUSY;
+
+        return 0;
+}
+
+static int systemd1_broker_manager_call_backend(Systemd1BrokerManager *manager, const char *unit_name, int (*operation)(void *userdata, const char *unit_name, const Systemd1BrokerBackendUnitExtra *extra)) {
+        Systemd1BrokerBackendUnitExtra extra;
+        Systemd1BrokerUnit *unit;
+
+        assert(manager);
+        assert(unit_name);
+
+        if (!operation)
+                return 0;
+
+        unit = systemd1_broker_manager_get_unit(manager, unit_name);
+        if (!unit)
+                return -ENOENT;
+
+        extra = systemd1_broker_unit_backend_extra(unit);
+        return operation(manager->backend_ops.userdata, unit_name, &extra);
 }
 
 int systemd1_broker_manager_start_unit(Systemd1BrokerManager *manager, const char *unit_name, const char *mode, Systemd1BrokerJob **ret) {
-        return systemd1_broker_manager_add_operation(manager, unit_name, mode, "start", SYSTEMD1_BROKER_BACKEND_RUNNING, ret);
+        int r;
+
+        assert(manager);
+
+        r = systemd1_broker_manager_prepare_operation(manager, unit_name, mode);
+        if (r < 0)
+                return r;
+
+        r = systemd1_broker_manager_call_backend(manager, unit_name, manager->backend_ops.start);
+        if (r < 0)
+                return r;
+
+        return systemd1_broker_manager_add_job_internal(manager, unit_name, "start", SYSTEMD1_BROKER_BACKEND_RUNNING, ret);
 }
 
 int systemd1_broker_manager_stop_unit(Systemd1BrokerManager *manager, const char *unit_name, const char *mode, Systemd1BrokerJob **ret) {
-        return systemd1_broker_manager_add_operation(manager, unit_name, mode, "stop", SYSTEMD1_BROKER_BACKEND_STOPPED, ret);
+        int r;
+
+        assert(manager);
+
+        r = systemd1_broker_manager_prepare_operation(manager, unit_name, mode);
+        if (r < 0)
+                return r;
+
+        r = systemd1_broker_manager_call_backend(manager, unit_name, manager->backend_ops.stop);
+        if (r < 0)
+                return r;
+
+        return systemd1_broker_manager_add_job_internal(manager, unit_name, "stop", SYSTEMD1_BROKER_BACKEND_STOPPED, ret);
 }
 
 int systemd1_broker_manager_restart_unit(Systemd1BrokerManager *manager, const char *unit_name, const char *mode, Systemd1BrokerJob **ret) {
-        return systemd1_broker_manager_add_operation(manager, unit_name, mode, "restart", SYSTEMD1_BROKER_BACKEND_RUNNING, ret);
+        int r;
+
+        assert(manager);
+
+        r = systemd1_broker_manager_prepare_operation(manager, unit_name, mode);
+        if (r < 0)
+                return r;
+
+        r = systemd1_broker_manager_call_backend(manager, unit_name, manager->backend_ops.stop);
+        if (r < 0)
+                return r;
+
+        r = systemd1_broker_manager_call_backend(manager, unit_name, manager->backend_ops.start);
+        if (r < 0)
+                return r;
+
+        return systemd1_broker_manager_add_job_internal(manager, unit_name, "restart", SYSTEMD1_BROKER_BACKEND_RUNNING, ret);
 }
 
 int systemd1_broker_manager_reload_unit(Systemd1BrokerManager *manager, const char *unit_name, const char *mode, Systemd1BrokerJob **ret) {
@@ -411,10 +561,7 @@ int systemd1_broker_manager_reload_unit(Systemd1BrokerManager *manager, const ch
         if (r < 0)
                 return r;
 
-        if (!systemd1_broker_manager_get_unit(manager, unit_name))
-                return -ENOENT;
-
-        return -EOPNOTSUPP;
+        return systemd1_broker_manager_add_job_internal(manager, unit_name, "reload", _SYSTEMD1_BROKER_BACKEND_STATE_INVALID, ret);
 }
 
 int systemd1_broker_manager_try_restart_unit(Systemd1BrokerManager *manager, const char *unit_name, const char *mode, Systemd1BrokerJob **ret) {
@@ -438,6 +585,17 @@ int systemd1_broker_manager_try_restart_unit(Systemd1BrokerManager *manager, con
                         *ret = NULL;
                 return 0;
         }
+
+        if (unit->job)
+                return -EBUSY;
+
+        r = systemd1_broker_manager_call_backend(manager, unit_name, manager->backend_ops.stop);
+        if (r < 0)
+                return r;
+
+        r = systemd1_broker_manager_call_backend(manager, unit_name, manager->backend_ops.start);
+        if (r < 0)
+                return r;
 
         return systemd1_broker_manager_add_job_internal(manager, unit_name, "restart", SYSTEMD1_BROKER_BACKEND_RUNNING, ret);
 }

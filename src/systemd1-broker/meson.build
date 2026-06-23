@@ -6,6 +6,13 @@ systemd1_broker_sources = files(
         'systemd1-broker.c',
 )
 
+systemd1_broker_backend_servicectl = shared_library(
+        'systemd1-broker-backend-servicectl',
+        files('systemd1-broker-backend-servicectl.c'),
+        include_directories : includes + include_directories('.'),
+        install : false,
+        build_by_default : want_tests != 'false')
+
 executables += [
         executable_template + {
                 'name' : 'systemd1-broker',

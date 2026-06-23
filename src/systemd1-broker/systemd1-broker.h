@@ -2,18 +2,7 @@
 #pragma once
 
 #include "basic-forward.h"
-
-typedef enum Systemd1BrokerBackendState {
-        SYSTEMD1_BROKER_BACKEND_ABSENT,
-        SYSTEMD1_BROKER_BACKEND_STARTING,
-        SYSTEMD1_BROKER_BACKEND_RUNNING,
-        SYSTEMD1_BROKER_BACKEND_RELOADING,
-        SYSTEMD1_BROKER_BACKEND_STOPPING,
-        SYSTEMD1_BROKER_BACKEND_STOPPED,
-        SYSTEMD1_BROKER_BACKEND_FAILED,
-        _SYSTEMD1_BROKER_BACKEND_STATE_MAX,
-        _SYSTEMD1_BROKER_BACKEND_STATE_INVALID = -EINVAL,
-} Systemd1BrokerBackendState;
+#include "systemd1-broker-backend-api.h"
 
 typedef struct Systemd1BrokerUnit Systemd1BrokerUnit;
 typedef struct Systemd1BrokerManager Systemd1BrokerManager;
@@ -81,8 +70,11 @@ const char* systemd1_broker_backend_state_to_sub_state(Systemd1BrokerBackendStat
 
 Systemd1BrokerManager* systemd1_broker_manager_free(Systemd1BrokerManager *manager);
 int systemd1_broker_manager_new(Systemd1BrokerManager **ret);
+int systemd1_broker_manager_set_backend(Systemd1BrokerManager *manager, const Systemd1BrokerBackendOps *ops);
+int systemd1_broker_manager_load_backend(Systemd1BrokerManager *manager, const char *path);
 int systemd1_broker_manager_add_unit(Systemd1BrokerManager *manager, const char *name, const char *description, Systemd1BrokerUnit **ret);
 Systemd1BrokerUnit* systemd1_broker_manager_get_unit(Systemd1BrokerManager *manager, const char *name);
+int systemd1_broker_manager_refresh_unit_status(Systemd1BrokerManager *manager, const char *name);
 int systemd1_broker_manager_get_unit_info(Systemd1BrokerManager *manager, const char *name, Systemd1BrokerUnitInfo *ret);
 size_t systemd1_broker_manager_n_units(Systemd1BrokerManager *manager);
 Systemd1BrokerUnit* systemd1_broker_manager_unit_at(Systemd1BrokerManager *manager, size_t index);

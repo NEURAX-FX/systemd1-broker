@@ -15,6 +15,10 @@ static int reply_no_such_unit(sd_bus_error *ret_error, const char *name) {
         return sd_bus_error_setf(ret_error, "org.freedesktop.systemd1.NoSuchUnit", "Unit %s not found.", name);
 }
 
+static int reply_no_such_job(sd_bus_error *ret_error, uint32_t id) {
+        return sd_bus_error_setf(ret_error, "org.freedesktop.systemd1.NoSuchJob", "Job %u does not exist.", (unsigned) id);
+}
+
 static int reply_job_error(sd_bus_error *ret_error, int r) {
         if (r == -EOPNOTSUPP)
                 return sd_bus_error_set(ret_error, SD_BUS_ERROR_NOT_SUPPORTED, "Operation is not supported.");
@@ -250,6 +254,40 @@ static int method_list_jobs(sd_bus_message *message, void *userdata, sd_bus_erro
         return sd_bus_send(NULL, reply, NULL);
 }
 
+static int method_get_job(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
+        Systemd1BrokerManager *manager = ASSERT_PTR(userdata);
+        Systemd1BrokerJobInfo info;
+        uint32_t id;
+        int r;
+
+        r = sd_bus_message_read(message, "u", &id);
+        if (r < 0)
+                return r;
+
+        r = systemd1_broker_manager_get_job_info(manager, id, &info);
+        if (r == -ENOENT)
+                return reply_no_such_job(ret_error, id);
+        if (r < 0)
+                return r;
+
+        return sd_bus_reply_method_return(message, "o", info.path);
+}
+
+static int method_cancel_job(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
+        Systemd1BrokerManager *manager = ASSERT_PTR(userdata);
+        uint32_t id;
+        int r;
+
+        r = sd_bus_message_read(message, "u", &id);
+        if (r < 0)
+                return r;
+
+        if (!systemd1_broker_manager_get_job(manager, id))
+                return reply_no_such_job(ret_error, id);
+
+        return sd_bus_error_set(ret_error, SD_BUS_ERROR_NOT_SUPPORTED, "Job cancellation is not supported.");
+}
+
 int systemd1_broker_dbus_emit_job_new(sd_bus *bus, const Systemd1BrokerJobInfo *info) {
         assert(bus);
         assert(info);
@@ -359,7 +397,26 @@ static int method_try_restart_unit(sd_bus_message *message, void *userdata, sd_b
         return method_unit_operation(message, userdata, ret_error, systemd1_broker_manager_try_restart_unit);
 }
 
+static int method_reload_or_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
+        return method_unit_operation(message, userdata, ret_error, systemd1_broker_manager_restart_unit);
+}
+
 static int method_noop(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
+        return sd_bus_reply_method_return(message, NULL);
+}
+
+static int method_reset_failed_unit(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
+        Systemd1BrokerManager *manager = ASSERT_PTR(userdata);
+        const char *name;
+        int r;
+
+        r = sd_bus_message_read(message, "s", &name);
+        if (r < 0)
+                return r;
+
+        if (!systemd1_broker_manager_get_unit(manager, name))
+                return reply_no_such_unit(ret_error, name);
+
         return sd_bus_reply_method_return(message, NULL);
 }
 
@@ -941,6 +998,16 @@ static const sd_bus_vtable manager_vtable[] = {
                                 SD_BUS_RESULT("a(usssoo)", jobs),
                                 method_list_jobs,
                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("GetJob",
+                                SD_BUS_ARGS("u", id),
+                                SD_BUS_RESULT("o", job),
+                                method_get_job,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("CancelJob",
+                                SD_BUS_ARGS("u", id),
+                                SD_BUS_NO_RESULT,
+                                method_cancel_job,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD_WITH_ARGS("StartUnit",
                                 SD_BUS_ARGS("s", name, "s", mode),
                                 SD_BUS_RESULT("o", job),
@@ -966,8 +1033,20 @@ static const sd_bus_vtable manager_vtable[] = {
                                 SD_BUS_RESULT("o", job),
                                 method_try_restart_unit,
                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("ReloadOrRestartUnit",
+                                SD_BUS_ARGS("s", name, "s", mode),
+                                SD_BUS_RESULT("o", job),
+                                method_reload_or_restart_unit,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("ResetFailedUnit",
+                                SD_BUS_ARGS("s", name),
+                                SD_BUS_NO_RESULT,
+                                method_reset_failed_unit,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("Subscribe", NULL, NULL, method_noop, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("Unsubscribe", NULL, NULL, method_noop, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("ResetFailed", NULL, NULL, method_noop, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("Reload", NULL, NULL, method_noop, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_SIGNAL_WITH_ARGS("JobNew",
                                 SD_BUS_ARGS("u", id, "o", job, "s", unit),
                                 0),
