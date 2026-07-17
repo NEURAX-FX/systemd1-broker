@@ -396,7 +396,9 @@ refresh path.
 The backend adapter is the only layer that knows how to control the real service
 manager. It intentionally has a narrow init-neutral contract; see
 `docs/superpowers/specs/2026-06-22-systemd1-broker-backend-design.md` for the
-full backend design. Its contract is:
+full backend design and
+`docs/superpowers/specs/2026-07-17-systemd1-broker-unit-catalog-sync-design.md`
+for catalog synchronization. Its contract is:
 
 1. Enumerate known services and their current state.
 2. Resolve a unit name to a backend service id.

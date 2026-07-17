@@ -32,8 +32,7 @@ responsible only for querying, starting, and stopping one already-resolved unit.
 
 ## Decisions
 
-1. The backend core exposes exactly three operations: `Status`, `Start`, and
-   `Stop`.
+1. The backend core exposes `ListUnits`, `Status`, `Start`, and `Stop`.
 2. `ReloadUnit` is handled by the broker compatibility layer. It refreshes broker
    metadata and returns a successful broker job if the refresh succeeds.
 3. `RestartUnit` is handled by the broker as an ordered `Stop` followed by
@@ -51,8 +50,8 @@ The backend path has these layers:
 2. **Broker scheduler:** Resolves the requested unit, computes dependency order,
    and decomposes high-level operations into backend `Start` and `Stop` calls.
 3. **Metadata catalog:** Provides normalized unit metadata and execution details.
-4. **Backend adapter:** Implements `Status`, `Start`, and `Stop` for a concrete
-   service manager.
+4. **Backend adapter:** Implements `ListUnits`, `Status`, `Start`, and `Stop` for
+   a concrete service manager.
 
 Only the D-Bus facade uses systemd method names and systemd state strings. Only
 the backend adapter knows how to talk to `servicectl`, `s6`, `dinit`, or another
@@ -76,6 +75,10 @@ typedef enum Systemd1BrokerBackendState {
 typedef struct Systemd1BrokerBackend Systemd1BrokerBackend;
 typedef struct Systemd1BrokerUnitExtra Systemd1BrokerUnitExtra;
 
+int (*list_units)(Systemd1BrokerBackend *backend,
+                  Systemd1BrokerBackendUnit **ret_units,
+                  size_t *ret_n_units);
+
 int (*status)(Systemd1BrokerBackend *backend,
               const char *unit_name,
               const Systemd1BrokerUnitExtra *extra,
@@ -91,7 +94,9 @@ int (*stop)(Systemd1BrokerBackend *backend,
 ```
 
 The exact C names can change during implementation. The operation set and
-ownership boundary should not change without updating this design.
+ownership boundary should not change without updating this design. Catalog
+ownership and reconciliation are specified in
+`docs/superpowers/specs/2026-07-17-systemd1-broker-unit-catalog-sync-design.md`.
 
 ## Unit Extra
 
@@ -119,6 +124,9 @@ dependency metadata as permission to start or stop additional units.
 
 `Status(unit, extra)` returns the backend's current view of one unit. It must not
 start, stop, reload, or repair the unit.
+
+`ListUnits()` returns one complete init-neutral catalog snapshot. It must not
+start, stop, reload, or repair any unit.
 
 `Start(unit, extra)` requests that one unit become running. It may return after
 the request is accepted or after completion, depending on backend capability. The
@@ -223,12 +231,13 @@ init-neutral control surface and SysVision/OrchestrD/PropertyD side channels.
 
 Expected mapping:
 
-1. `Status` reads a unit's current phase from the servicectl status/property
+1. `ListUnits` reads all known units from the structured servicectl API.
+2. `Status` reads a unit's current phase from the servicectl status/property
    path, preferring existing SysVision state when available.
-2. `Start` sends the existing servicectl start request for one resolved unit.
-3. `Stop` sends the existing servicectl stop request for one resolved unit.
-4. Broker dependency ordering remains outside servicectl for the broker path.
-5. Extra metadata is passed to servicectl only when servicectl needs it to execute
+3. `Start` sends the existing servicectl start request for one resolved unit.
+4. `Stop` sends the existing servicectl stop request for one resolved unit.
+5. Broker dependency ordering remains outside servicectl for the broker path.
+6. Extra metadata is passed to servicectl only when servicectl needs it to execute
    units not already known to its own catalog.
 
 This keeps the systemd1 broker as a compatibility facade rather than a second
