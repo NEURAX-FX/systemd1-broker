@@ -59,8 +59,6 @@ static JobNewSignal* job_new_signal_done(JobNewSignal *signal) {
         return NULL;
 }
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(JobNewSignal*, job_new_signal_done);
-
 static UnitPropertiesChangedSignal* unit_properties_changed_signal_done(UnitPropertiesChangedSignal *signal) {
         if (!signal)
                 return NULL;
@@ -73,8 +71,6 @@ static UnitPropertiesChangedSignal* unit_properties_changed_signal_done(UnitProp
         return NULL;
 }
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(UnitPropertiesChangedSignal*, unit_properties_changed_signal_done);
-
 static JobRemovedSignal* job_removed_signal_done(JobRemovedSignal *signal) {
         if (!signal)
                 return NULL;
@@ -85,8 +81,6 @@ static JobRemovedSignal* job_removed_signal_done(JobRemovedSignal *signal) {
 
         return NULL;
 }
-
-DEFINE_TRIVIAL_CLEANUP_FUNC(JobRemovedSignal*, job_removed_signal_done);
 
 typedef struct TestBackendContext {
         unsigned status_calls;
