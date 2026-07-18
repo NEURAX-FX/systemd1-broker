@@ -142,6 +142,10 @@ static int method_list_units_common(
         size_t n_infos;
         int r;
 
+        r = systemd1_broker_manager_sync_units(manager);
+        if (r < 0 && !systemd1_broker_manager_has_synced_units(manager))
+                return r;
+
         r = by_names ?
                 systemd1_broker_manager_list_unit_infos_by_names(
                                 manager,
@@ -606,6 +610,50 @@ int systemd1_broker_dbus_emit_unit_properties_changed(sd_bus *bus, Systemd1Broke
                 return r;
 
         return sd_bus_send(bus, message, NULL);
+}
+
+int systemd1_broker_dbus_complete_jobs(sd_bus *bus, Systemd1BrokerManager *manager) {
+        int r;
+
+        assert(manager);
+
+        if (!bus)
+                return 0;
+
+        while (systemd1_broker_manager_n_jobs(manager) > 0) {
+                _cleanup_free_ char *path = NULL, *unit_id = NULL;
+                Systemd1BrokerJobInfo info;
+                Systemd1BrokerUnit *unit;
+
+                r = systemd1_broker_manager_job_info_at(manager, 0, &info);
+                if (r < 0)
+                        return r;
+
+                path = strdup(info.path);
+                unit_id = strdup(info.unit_id);
+                if (!path || !unit_id)
+                        return -ENOMEM;
+
+                info.path = path;
+                info.unit_id = unit_id;
+                unit = systemd1_broker_manager_get_unit(manager, unit_id);
+
+                r = systemd1_broker_manager_complete_job(manager, info.id);
+                if (r < 0)
+                        return r;
+
+                if (unit) {
+                        r = systemd1_broker_dbus_emit_unit_properties_changed(bus, unit);
+                        if (r < 0)
+                                return r;
+                }
+
+                r = systemd1_broker_dbus_emit_job_removed(bus, &info, "done");
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
 }
 
 static int method_unit_start(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
@@ -1216,13 +1264,22 @@ int systemd1_broker_serve_bus_fd_full(int fd, Systemd1BrokerManager *manager, bo
                 return r;
 
         while (!test_context.quit) {
+                bool processed;
+
                 r = sd_bus_process(bus, NULL);
                 if (ERRNO_IS_NEG_DISCONNECT(r))
                         break;
                 if (r < 0)
                         return r;
+                processed = r > 0;
 
-                if (r == 0) {
+                if (!add_test_api) {
+                        r = systemd1_broker_dbus_complete_jobs(bus, manager);
+                        if (r < 0)
+                                return r;
+                }
+
+                if (!processed) {
                         r = sd_bus_wait(bus, UINT64_MAX);
                         if (ERRNO_IS_NEG_DISCONNECT(r))
                                 break;

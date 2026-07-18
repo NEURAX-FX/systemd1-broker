@@ -72,6 +72,8 @@ Systemd1BrokerManager* systemd1_broker_manager_free(Systemd1BrokerManager *manag
 int systemd1_broker_manager_new(Systemd1BrokerManager **ret);
 int systemd1_broker_manager_set_backend(Systemd1BrokerManager *manager, const Systemd1BrokerBackendOps *ops);
 int systemd1_broker_manager_load_backend(Systemd1BrokerManager *manager, const char *path);
+int systemd1_broker_manager_sync_units(Systemd1BrokerManager *manager);
+bool systemd1_broker_manager_has_synced_units(Systemd1BrokerManager *manager);
 int systemd1_broker_manager_add_unit(Systemd1BrokerManager *manager, const char *name, const char *description, Systemd1BrokerUnit **ret);
 Systemd1BrokerUnit* systemd1_broker_manager_get_unit(Systemd1BrokerManager *manager, const char *name);
 int systemd1_broker_manager_refresh_unit_status(Systemd1BrokerManager *manager, const char *name);

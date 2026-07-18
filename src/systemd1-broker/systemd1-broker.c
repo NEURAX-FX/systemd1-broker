@@ -19,6 +19,7 @@ struct Systemd1BrokerUnit {
         char *path;
         Systemd1BrokerBackendState backend_state;
         Systemd1BrokerJob *job;
+        uint64_t catalog_generation;
 };
 
 struct Systemd1BrokerManager {
@@ -27,6 +28,7 @@ struct Systemd1BrokerManager {
         Systemd1BrokerJob **jobs;
         size_t n_jobs;
         uint32_t next_job_id;
+        uint64_t catalog_generation;
         void *backend_dl;
         Systemd1BrokerBackendOps backend_ops;
 };
@@ -131,10 +133,141 @@ int systemd1_broker_manager_new(Systemd1BrokerManager **ret) {
 }
 
 static int systemd1_broker_backend_ops_verify(const Systemd1BrokerBackendOps *ops) {
-        if (!ops || ops->size < sizeof(Systemd1BrokerBackendOps) || !ops->status || !ops->start || !ops->stop)
+        if (!ops || ops->size < sizeof(Systemd1BrokerBackendOps) || !ops->status || !ops->start || !ops->stop ||
+            !ops->list_units || !ops->free_units)
                 return -EINVAL;
 
         return 0;
+}
+
+typedef struct PreparedCatalogUnit {
+        Systemd1BrokerUnit *existing;
+        Systemd1BrokerUnit *new_unit;
+        char *description;
+        Systemd1BrokerBackendState state;
+} PreparedCatalogUnit;
+
+static void prepared_catalog_units_free(PreparedCatalogUnit *prepared, size_t n) {
+        if (!prepared)
+                return;
+
+        for (size_t i = 0; i < n; i++) {
+                systemd1_broker_unit_free(prepared[i].new_unit);
+                free(prepared[i].description);
+        }
+        free(prepared);
+}
+
+int systemd1_broker_manager_sync_units(Systemd1BrokerManager *manager) {
+        Systemd1BrokerBackendUnit *backend_units = NULL;
+        PreparedCatalogUnit *prepared = NULL;
+        size_t n_backend_units = 0, n_new = 0;
+        uint64_t generation;
+        int r;
+
+        assert(manager);
+
+        if (!manager->backend_ops.list_units || !manager->backend_ops.free_units)
+                return 0;
+
+        r = manager->backend_ops.list_units(manager->backend_ops.userdata, &backend_units, &n_backend_units);
+        if (r < 0)
+                return r;
+        if (n_backend_units > 0 && !backend_units) {
+                r = -EBADMSG;
+                goto finish;
+        }
+
+        if (n_backend_units > 0) {
+                prepared = new0(PreparedCatalogUnit, n_backend_units);
+                if (!prepared) {
+                        r = -ENOMEM;
+                        goto finish;
+                }
+        }
+
+        for (size_t i = 0; i < n_backend_units; i++) {
+                const Systemd1BrokerBackendUnit *item = backend_units + i;
+
+                if (item->size < sizeof(Systemd1BrokerBackendUnit) ||
+                    !item->id || !unit_name_is_valid(item->id, UNIT_NAME_PLAIN|UNIT_NAME_INSTANCE) ||
+                    !systemd1_broker_backend_state_to_active_state(item->state)) {
+                        r = -EBADMSG;
+                        goto finish;
+                }
+                for (size_t j = 0; j < i; j++)
+                        if (streq(backend_units[j].id, item->id)) {
+                                r = -EEXIST;
+                                goto finish;
+                        }
+
+                prepared[i].existing = systemd1_broker_manager_get_unit(manager, item->id);
+                prepared[i].state = item->state;
+                if (prepared[i].existing) {
+                        prepared[i].description = strdup(empty_to_null(item->description) ?: item->id);
+                        if (!prepared[i].description) {
+                                r = -ENOMEM;
+                                goto finish;
+                        }
+                } else {
+                        r = systemd1_broker_unit_new(item->id, empty_to_null(item->description) ?: item->id, &prepared[i].new_unit);
+                        if (r < 0)
+                                goto finish;
+                        prepared[i].new_unit->backend_state = item->state;
+                        n_new++;
+                }
+        }
+
+        if (!GREEDY_REALLOC(manager->units, manager->n_units + n_new)) {
+                r = -ENOMEM;
+                goto finish;
+        }
+        if (manager->catalog_generation == UINT64_MAX) {
+                r = -EOVERFLOW;
+                goto finish;
+        }
+        generation = manager->catalog_generation + 1;
+
+        for (size_t i = 0; i < n_backend_units; i++) {
+                Systemd1BrokerUnit *unit;
+
+                if (prepared[i].existing) {
+                        unit = prepared[i].existing;
+                        free_and_replace(unit->description, prepared[i].description);
+                        unit->backend_state = prepared[i].state;
+                } else {
+                        unit = TAKE_PTR(prepared[i].new_unit);
+                        unit->manager = manager;
+                        manager->units[manager->n_units++] = unit;
+                }
+                unit->catalog_generation = generation;
+        }
+
+        for (size_t i = 0; i < manager->n_units; ) {
+                Systemd1BrokerUnit *unit = manager->units[i];
+
+                if (unit->catalog_generation == 0 || unit->catalog_generation == generation || unit->job) {
+                        i++;
+                        continue;
+                }
+
+                memmove(manager->units + i, manager->units + i + 1, sizeof(Systemd1BrokerUnit*) * (manager->n_units - i - 1));
+                manager->n_units--;
+                systemd1_broker_unit_free(unit);
+        }
+        manager->catalog_generation = generation;
+        r = 0;
+
+finish:
+        prepared_catalog_units_free(prepared, n_backend_units);
+        manager->backend_ops.free_units(manager->backend_ops.userdata, backend_units, n_backend_units);
+        return r;
+}
+
+bool systemd1_broker_manager_has_synced_units(Systemd1BrokerManager *manager) {
+        assert(manager);
+
+        return manager->catalog_generation > 0;
 }
 
 int systemd1_broker_manager_set_backend(Systemd1BrokerManager *manager, const Systemd1BrokerBackendOps *ops) {
@@ -356,7 +489,26 @@ int systemd1_broker_manager_get_unit_path(Systemd1BrokerManager *manager, const 
 }
 
 int systemd1_broker_manager_load_unit_path(Systemd1BrokerManager *manager, const char *name, const char **ret) {
-        return systemd1_broker_manager_get_unit_path(manager, name, ret);
+        Systemd1BrokerUnit *unit;
+        int r;
+
+        assert(manager);
+        assert(name);
+        assert(ret);
+
+        unit = systemd1_broker_manager_get_unit(manager, name);
+        if (!unit) {
+                r = systemd1_broker_manager_add_unit(manager, name, name, &unit);
+                if (r < 0)
+                        return r;
+        }
+
+        r = systemd1_broker_manager_refresh_unit_status(manager, name);
+        if (r < 0)
+                return r;
+
+        *ret = systemd1_broker_unit_path(unit);
+        return 0;
 }
 
 static Systemd1BrokerBackendUnitExtra systemd1_broker_unit_backend_extra(Systemd1BrokerUnit *unit) {
@@ -502,6 +654,18 @@ int systemd1_broker_manager_start_unit(Systemd1BrokerManager *manager, const cha
         int r;
 
         assert(manager);
+        assert(unit_name);
+        assert(mode);
+
+        r = systemd1_broker_manager_validate_job_mode(mode);
+        if (r < 0)
+                return r;
+
+        if (!systemd1_broker_manager_get_unit(manager, unit_name)) {
+                r = systemd1_broker_manager_add_unit(manager, unit_name, unit_name, NULL);
+                if (r < 0)
+                        return r;
+        }
 
         r = systemd1_broker_manager_prepare_operation(manager, unit_name, mode);
         if (r < 0)

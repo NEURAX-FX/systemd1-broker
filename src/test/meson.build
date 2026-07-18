@@ -458,6 +458,12 @@ executables += [
                 'dependencies' : libselinux_cflags,
         },
         test_template + {
+                'sources' : files('test-systemd1-broker-backend-servicectl.c'),
+                'include_directories' : includes + include_directories('../systemd1-broker'),
+                'dependencies' : [libdl, threads],
+                'test_depends_targets' : [systemd1_broker_backend_servicectl],
+        },
+        test_template + {
                 'sources' : files('test-systemd1-broker.c') + systemd1_broker_sources,
                 'include_directories' : includes + include_directories('../systemd1-broker'),
                 'test_depends' : ['systemd1-broker'],

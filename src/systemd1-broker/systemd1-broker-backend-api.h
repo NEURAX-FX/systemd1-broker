@@ -29,12 +29,21 @@ typedef struct Systemd1BrokerBackendUnitExtra {
         const char *target;
 } Systemd1BrokerBackendUnitExtra;
 
+typedef struct Systemd1BrokerBackendUnit {
+        size_t size;
+        const char *id;
+        const char *description;
+        Systemd1BrokerBackendState state;
+} Systemd1BrokerBackendUnit;
+
 typedef struct Systemd1BrokerBackendOps {
         size_t size;
         void *userdata;
         int (*status)(void *userdata, const char *unit_name, const Systemd1BrokerBackendUnitExtra *extra, Systemd1BrokerBackendState *ret_state);
         int (*start)(void *userdata, const char *unit_name, const Systemd1BrokerBackendUnitExtra *extra);
         int (*stop)(void *userdata, const char *unit_name, const Systemd1BrokerBackendUnitExtra *extra);
+        int (*list_units)(void *userdata, Systemd1BrokerBackendUnit **ret_units, size_t *ret_n_units);
+        void (*free_units)(void *userdata, Systemd1BrokerBackendUnit *units, size_t n_units);
 } Systemd1BrokerBackendOps;
 
 #define SYSTEMD1_BROKER_BACKEND_GET_OPS_SYMBOL "systemd1_broker_backend_get_ops"

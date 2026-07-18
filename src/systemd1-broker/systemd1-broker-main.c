@@ -24,6 +24,7 @@
 
 static const char *arg_socket = NULL;
 static const char *arg_bus_address = NULL;
+static const char *arg_backend = NULL;
 
 static int help(void) {
         printf("%s [OPTIONS...]\n\n"
@@ -31,7 +32,8 @@ static int help(void) {
                "  -h --help             Show this help\n"
                "     --version          Show package version\n"
                "     --socket=PATH      Listen on this Unix stream socket\n"
-               "     --bus-address=ADDR Connect to this D-Bus bus and own org.freedesktop.systemd1\n",
+               "     --bus-address=ADDR Connect to this D-Bus bus and own org.freedesktop.systemd1\n"
+               "     --backend=PATH     Load backend shared library\n",
                program_invocation_short_name);
 
         return 0;
@@ -42,6 +44,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_VERSION = 0x100,
                 ARG_SOCKET,
                 ARG_BUS_ADDRESS,
+                ARG_BACKEND,
         };
 
         static const struct option options[] = {
@@ -49,6 +52,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "version",     no_argument,       NULL, ARG_VERSION     },
                 { "socket",      required_argument, NULL, ARG_SOCKET      },
                 { "bus-address", required_argument, NULL, ARG_BUS_ADDRESS },
+                { "backend",     required_argument, NULL, ARG_BACKEND     },
                 {}
         };
 
@@ -73,6 +77,10 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_bus_address = optarg;
                         break;
 
+                case ARG_BACKEND:
+                        arg_backend = optarg;
+                        break;
+
                 case '?':
                         return -EINVAL;
 
@@ -91,6 +99,12 @@ static int parse_argv(int argc, char *argv[]) {
 
         if (isempty(arg_bus_address))
                 arg_bus_address = NULL;
+
+        if (isempty(arg_backend))
+                arg_backend = NULL;
+
+        if (arg_backend && !path_is_absolute(arg_backend))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--backend=PATH must be absolute.");
 
         return 1;
 }
@@ -219,9 +233,15 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate broker manager: %m");
 
-        r = systemd1_broker_manager_add_unit(manager, "alpha.service", "Alpha", NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add static alpha.service: %m");
+        if (arg_backend) {
+                r = systemd1_broker_manager_load_backend(manager, arg_backend);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to load broker backend %s: %m", arg_backend);
+
+                r = systemd1_broker_manager_sync_units(manager);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to synchronize broker unit catalog: %m");
+        }
 
         listen_fd = make_listen_socket(arg_socket);
         if (listen_fd < 0)
@@ -239,6 +259,10 @@ static int run(int argc, char *argv[]) {
                 r = process_bus(system_bus);
                 if (r < 0)
                         return log_error_errno(r, "Failed to process D-Bus bus connection: %m");
+
+                r = systemd1_broker_dbus_complete_jobs(system_bus, manager);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to complete broker jobs: %m");
 
                 r = bus_poll_timeout(system_bus, &timeout);
                 if (r < 0)
