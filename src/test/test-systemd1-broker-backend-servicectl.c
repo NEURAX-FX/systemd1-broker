@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 
@@ -91,6 +92,8 @@ static const Systemd1BrokerBackendOps* load_backend(void **ret_dl) {
         ASSERT_NOT_NULL(ops->stop);
         ASSERT_NOT_NULL(ops->list_units);
         ASSERT_NOT_NULL(ops->free_units);
+        ASSERT_NOT_NULL(ops->get_unit_snapshot);
+        ASSERT_NOT_NULL(ops->free_unit_snapshot);
         ASSERT_NULL(dlsym(dl, "sd_bus_open_system"));
 
         *ret_dl = dl;
@@ -193,6 +196,178 @@ TEST(list_units_rejects_malformed_catalog) {
         ASSERT_ERROR(ops->list_units(ops->userdata, &units, &n_units), EBADMSG);
         http_stub_done(&stub);
         ASSERT_NULL(units);
+
+        free(stub.request);
+        ASSERT_OK_ERRNO(unsetenv("SYSTEMD1_BROKER_SERVICECTL_SOCKET"));
+}
+
+TEST(get_unit_snapshot_uses_servicectl_api) {
+        static const char body[] =
+                "{\"unit\":{\"name\":\"demo.service\",\"description\":\"Demo \\u0026 Worker\","
+                "\"state\":\"STARTED\",\"lifecycle\":\"ready\"},"
+                "\"systemd_properties\":["
+                "{\"interface\":\"org.freedesktop.systemd1.Unit\",\"name\":\"FragmentPath\","
+                "\"signature\":\"s\",\"value\":\"/etc/systemd/system/demo.service\"},"
+                "{\"interface\":\"org.freedesktop.systemd1.Service\",\"name\":\"MainPID\","
+                "\"signature\":\"u\",\"value\":4242},"
+                "{\"interface\":\"org.freedesktop.systemd1.Service\",\"name\":\"ExecStart\","
+                "\"signature\":\"a(sasbttttuii)\","
+                "\"value\":[[\"/usr/bin/demo\",[\"/usr/bin/demo\",\"--serve\"],false,0,0,0,0,0,0,0]]}]}";
+        _cleanup_(dlclosep) void *dl = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *tmp = NULL;
+        _cleanup_free_ char *response = NULL, *socket_path = NULL;
+        Systemd1BrokerBackendUnitSnapshot *snapshot = NULL;
+        const Systemd1BrokerBackendOps *ops;
+        const Systemd1BrokerBackendUnitExtra extra = {
+                .size = sizeof(Systemd1BrokerBackendUnitExtra),
+                .id = "demo@blue.service",
+        };
+        HTTPStub stub;
+
+        ASSERT_OK(mkdtemp_malloc(NULL, &tmp));
+        socket_path = path_join(tmp, "servicectl.sock");
+        ASSERT_NOT_NULL(socket_path);
+        ASSERT_OK_ERRNO(setenv("SYSTEMD1_BROKER_SERVICECTL_SOCKET", socket_path, true));
+        ASSERT_OK(asprintf(&response,
+                           "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+                           strlen(body), body));
+        ops = load_backend(&dl);
+
+        http_stub_start(&stub, socket_path, response);
+        ASSERT_OK(ops->get_unit_snapshot(ops->userdata, extra.id, &extra, &snapshot));
+        http_stub_done(&stub);
+
+        ASSERT_NOT_NULL(snapshot);
+        ASSERT_EQ(snapshot->size, sizeof(Systemd1BrokerBackendUnitSnapshot));
+        ASSERT_EQ(snapshot->state, SYSTEMD1_BROKER_BACKEND_RUNNING);
+        ASSERT_STREQ(snapshot->description, "Demo & Worker");
+        ASSERT_EQ(snapshot->n_properties, 3u);
+        ASSERT_EQ(snapshot->properties[0].size, sizeof(Systemd1BrokerBackendProperty));
+        ASSERT_STREQ(snapshot->properties[0].interface, "org.freedesktop.systemd1.Unit");
+        ASSERT_STREQ(snapshot->properties[0].name, "FragmentPath");
+        ASSERT_STREQ(snapshot->properties[0].signature, "s");
+        ASSERT_STREQ(snapshot->properties[0].value_json, "\"/etc/systemd/system/demo.service\"");
+        ASSERT_STREQ(snapshot->properties[1].value_json, "4242");
+        ASSERT_STREQ(snapshot->properties[2].value_json,
+                     "[[\"/usr/bin/demo\",[\"/usr/bin/demo\",\"--serve\"],false,0,0,0,0,0,0,0]]");
+        ASSERT_TRUE(startswith(stub.request, "GET /v1/units/demo%40blue.service HTTP/1.1\r\n"));
+
+        ops->free_unit_snapshot(ops->userdata, snapshot);
+        free(stub.request);
+        ASSERT_OK_ERRNO(unsetenv("SYSTEMD1_BROKER_SERVICECTL_SOCKET"));
+}
+
+TEST(get_unit_snapshot_maps_missing_unit_to_absent) {
+        static const char response[] = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        _cleanup_(dlclosep) void *dl = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *tmp = NULL;
+        _cleanup_free_ char *socket_path = NULL;
+        Systemd1BrokerBackendUnitSnapshot *snapshot = NULL;
+        const Systemd1BrokerBackendOps *ops;
+        const Systemd1BrokerBackendUnitExtra extra = {
+                .size = sizeof(Systemd1BrokerBackendUnitExtra),
+                .id = "missing.service",
+        };
+        HTTPStub stub;
+
+        ASSERT_OK(mkdtemp_malloc(NULL, &tmp));
+        socket_path = path_join(tmp, "servicectl.sock");
+        ASSERT_NOT_NULL(socket_path);
+        ASSERT_OK_ERRNO(setenv("SYSTEMD1_BROKER_SERVICECTL_SOCKET", socket_path, true));
+        ops = load_backend(&dl);
+
+        http_stub_start(&stub, socket_path, response);
+        ASSERT_OK(ops->get_unit_snapshot(ops->userdata, extra.id, &extra, &snapshot));
+        http_stub_done(&stub);
+
+        ASSERT_NOT_NULL(snapshot);
+        ASSERT_EQ(snapshot->state, SYSTEMD1_BROKER_BACKEND_ABSENT);
+        ASSERT_NULL(snapshot->description);
+        ASSERT_NULL(snapshot->properties);
+        ASSERT_EQ(snapshot->n_properties, 0u);
+        ops->free_unit_snapshot(ops->userdata, snapshot);
+
+        free(stub.request);
+        ASSERT_OK_ERRNO(unsetenv("SYSTEMD1_BROKER_SERVICECTL_SOCKET"));
+}
+
+TEST(get_unit_snapshot_rejects_malformed_property) {
+        static const char body[] =
+                "{\"unit\":{\"name\":\"demo.service\",\"description\":\"Demo\",\"state\":\"STARTED\"},"
+                "\"systemd_properties\":["
+                "{\"interface\":\"org.freedesktop.systemd1.Unit\",\"name\":\"Description\","
+                "\"signature\":\"s\",\"value\":\"Demo\"},"
+                "{\"interface\":\"org.freedesktop.systemd1.Unit\","
+                "\"name\":\"FragmentPath\",\"value\":\"/etc/systemd/system/demo.service\"}]}";
+        _cleanup_(dlclosep) void *dl = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *tmp = NULL;
+        _cleanup_free_ char *response = NULL, *socket_path = NULL;
+        Systemd1BrokerBackendUnitSnapshot *snapshot = NULL;
+        const Systemd1BrokerBackendOps *ops;
+        const Systemd1BrokerBackendUnitExtra extra = {
+                .size = sizeof(Systemd1BrokerBackendUnitExtra),
+                .id = "demo.service",
+        };
+        HTTPStub stub;
+
+        ASSERT_OK(mkdtemp_malloc(NULL, &tmp));
+        socket_path = path_join(tmp, "servicectl.sock");
+        ASSERT_NOT_NULL(socket_path);
+        ASSERT_OK_ERRNO(setenv("SYSTEMD1_BROKER_SERVICECTL_SOCKET", socket_path, true));
+        ASSERT_OK(asprintf(&response,
+                           "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+                           strlen(body), body));
+        ops = load_backend(&dl);
+
+        http_stub_start(&stub, socket_path, response);
+        ASSERT_ERROR(ops->get_unit_snapshot(ops->userdata, extra.id, &extra, &snapshot), EBADMSG);
+        http_stub_done(&stub);
+        ASSERT_NULL(snapshot);
+
+        free(stub.request);
+        ASSERT_OK_ERRNO(unsetenv("SYSTEMD1_BROKER_SERVICECTL_SOCKET"));
+}
+
+TEST(get_unit_snapshot_rejects_property_limit) {
+        _cleanup_(dlclosep) void *dl = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *tmp = NULL;
+        _cleanup_free_ char *body = NULL, *response = NULL, *socket_path = NULL;
+        Systemd1BrokerBackendUnitSnapshot *snapshot = NULL;
+        const Systemd1BrokerBackendOps *ops;
+        const Systemd1BrokerBackendUnitExtra extra = {
+                .size = sizeof(Systemd1BrokerBackendUnitExtra),
+                .id = "demo.service",
+        };
+        HTTPStub stub;
+        FILE *stream;
+        size_t body_size = 0;
+
+        stream = ASSERT_PTR(open_memstream(&body, &body_size));
+        ASSERT_GT(fprintf(stream,
+                          "{\"unit\":{\"name\":\"demo.service\",\"description\":\"Demo\",\"state\":\"STARTED\"},"
+                          "\"systemd_properties\":["), 0);
+        for (unsigned i = 0; i < 257; i++)
+                ASSERT_GT(fprintf(stream,
+                                  "%s{\"interface\":\"org.freedesktop.systemd1.Unit\","
+                                  "\"name\":\"Property%u\",\"signature\":\"u\",\"value\":%u}",
+                                  i == 0 ? "" : ",", i, i), 0);
+        ASSERT_GT(fprintf(stream, "]}"), 0);
+        ASSERT_OK_ERRNO(fclose(stream));
+
+        ASSERT_OK(mkdtemp_malloc(NULL, &tmp));
+        socket_path = path_join(tmp, "servicectl.sock");
+        ASSERT_NOT_NULL(socket_path);
+        ASSERT_OK_ERRNO(setenv("SYSTEMD1_BROKER_SERVICECTL_SOCKET", socket_path, true));
+        ASSERT_OK(asprintf(&response,
+                           "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+                           body_size, body));
+        ops = load_backend(&dl);
+
+        http_stub_start(&stub, socket_path, response);
+        ASSERT_ERROR(ops->get_unit_snapshot(ops->userdata, extra.id, &extra, &snapshot), E2BIG);
+        http_stub_done(&stub);
+        ASSERT_NULL(snapshot);
+        ops->free_unit_snapshot(ops->userdata, NULL);
 
         free(stub.request);
         ASSERT_OK_ERRNO(unsetenv("SYSTEMD1_BROKER_SERVICECTL_SOCKET"));

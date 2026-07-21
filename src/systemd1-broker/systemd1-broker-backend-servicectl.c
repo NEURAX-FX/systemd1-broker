@@ -3,8 +3,10 @@
 #include <errno.h>
 #include <spawn.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -22,6 +24,8 @@ extern char **environ;
 #define DEFAULT_SERVICECTL_SOCKET "/run/servicectl/servicectl.sock"
 #define DEFAULT_SERVICECTL_RUNTIME "/run/servicectl/managed"
 #define MAX_SYSVISION_RESPONSE_SIZE (1024U * 1024U)
+#define MAX_SNAPSHOT_PROPERTIES 256U
+#define MAX_JSON_DEPTH 64U
 #define SYSVISION_IO_TIMEOUT_SEC 5
 #define ACTIVATION_CONNECT_RETRIES 100
 #define ACTIVATION_CONNECT_RETRY_NSEC (50U * 1000U * 1000U)
@@ -423,6 +427,547 @@ finish:
         return r;
 }
 
+static int url_encode_path_segment(const char *value, char **ret) {
+        static const char hex[] = "0123456789ABCDEF";
+        char *encoded, *p;
+        size_t size;
+
+        if (strlen(value) > (SIZE_MAX - 1) / 3)
+                return -E2BIG;
+        size = strlen(value) * 3 + 1;
+        encoded = malloc(size);
+        if (!encoded)
+                return -ENOMEM;
+
+        p = encoded;
+        for (const unsigned char *q = (const unsigned char*) value; *q; q++) {
+                if ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') || (*q >= '0' && *q <= '9') || strchr("-._~", *q))
+                        *(p++) = (char) *q;
+                else {
+                        *(p++) = '%';
+                        *(p++) = hex[*q >> 4];
+                        *(p++) = hex[*q & 0x0f];
+                }
+        }
+        *p = 0;
+        *ret = encoded;
+        return 0;
+}
+
+static int query_servicectl_unit(const char *unit_name, char **ret_body) {
+        char *encoded = NULL, *request = NULL, *response = NULL, *body;
+        int fd = -1, status, r;
+
+        r = url_encode_path_segment(unit_name, &encoded);
+        if (r < 0)
+                return r;
+        if (asprintf(&request,
+                     "GET /v1/units/%s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                     encoded) < 0) {
+                r = -ENOMEM;
+                goto finish;
+        }
+
+        fd = connect_unix(servicectl_socket_path());
+        if (fd < 0) {
+                r = fd;
+                goto finish;
+        }
+        r = write_full(fd, request, strlen(request));
+        if (r < 0)
+                goto finish;
+        if (shutdown(fd, SHUT_WR) < 0) {
+                r = -errno;
+                goto finish;
+        }
+
+        r = read_all(fd, &response);
+        if (r < 0)
+                goto finish;
+        if (sscanf(response, "HTTP/%*u.%*u %d", &status) != 1) {
+                r = -EBADMSG;
+                goto finish;
+        }
+        if (status == 404) {
+                r = 0;
+                goto finish;
+        }
+        if (status != 200) {
+                r = -EIO;
+                goto finish;
+        }
+
+        body = strstr(response, "\r\n\r\n");
+        if (!body) {
+                r = -EBADMSG;
+                goto finish;
+        }
+        body += 4;
+        *ret_body = strdup(body);
+        r = *ret_body ? 1 : -ENOMEM;
+
+finish:
+        if (fd >= 0)
+                close(fd);
+        free(encoded);
+        free(request);
+        free(response);
+        return r;
+}
+
+static const char* json_skip_space_bound(const char *p, const char *end) {
+        while (p < end && strchr(" \t\r\n", *p))
+                p++;
+        return p;
+}
+
+static bool ascii_is_digit(char c) {
+        return c >= '0' && c <= '9';
+}
+
+static bool ascii_is_hex(char c) {
+        return ascii_is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static int json_scan_value(const char *p, const char *end, unsigned depth, const char **ret_end);
+
+static int json_scan_string(const char *p, const char *end, const char **ret_end) {
+        if (p >= end || *p++ != '"')
+                return -EBADMSG;
+
+        while (p < end) {
+                unsigned char c = (unsigned char) *(p++);
+
+                if (c == '"') {
+                        *ret_end = p;
+                        return 0;
+                }
+                if (c < 0x20)
+                        return -EBADMSG;
+                if (c != '\\')
+                        continue;
+                if (p >= end)
+                        return -EBADMSG;
+                c = (unsigned char) *(p++);
+                if (strchr("\"\\/bfnrt", c))
+                        continue;
+                if (c != 'u' || end - p < 4)
+                        return -EBADMSG;
+                for (unsigned i = 0; i < 4; i++)
+                        if (!ascii_is_hex(p[i]))
+                                return -EBADMSG;
+                p += 4;
+        }
+
+        return -EBADMSG;
+}
+
+static int json_scan_number(const char *p, const char *end, const char **ret_end) {
+        const char *start = p;
+
+        if (p < end && *p == '-')
+                p++;
+        if (p >= end)
+                return -EBADMSG;
+        if (*p == '0')
+                p++;
+        else {
+                if (!ascii_is_digit(*p))
+                        return -EBADMSG;
+                while (p < end && ascii_is_digit(*p))
+                        p++;
+        }
+        if (p < end && *p == '.') {
+                p++;
+                if (p >= end || !ascii_is_digit(*p))
+                        return -EBADMSG;
+                while (p < end && ascii_is_digit(*p))
+                        p++;
+        }
+        if (p < end && (*p == 'e' || *p == 'E')) {
+                p++;
+                if (p < end && (*p == '+' || *p == '-'))
+                        p++;
+                if (p >= end || !ascii_is_digit(*p))
+                        return -EBADMSG;
+                while (p < end && ascii_is_digit(*p))
+                        p++;
+        }
+        if (p == start)
+                return -EBADMSG;
+        *ret_end = p;
+        return 0;
+}
+
+static int json_scan_value(const char *p, const char *end, unsigned depth, const char **ret_end) {
+        int r;
+
+        if (depth > MAX_JSON_DEPTH)
+                return -E2BIG;
+        p = json_skip_space_bound(p, end);
+        if (p >= end)
+                return -EBADMSG;
+        if (*p == '"')
+                return json_scan_string(p, end, ret_end);
+        if (*p == '{') {
+                p = json_skip_space_bound(p + 1, end);
+                if (p < end && *p == '}') {
+                        *ret_end = p + 1;
+                        return 0;
+                }
+                for (;;) {
+                        r = json_scan_string(p, end, &p);
+                        if (r < 0)
+                                return r;
+                        p = json_skip_space_bound(p, end);
+                        if (p >= end || *p++ != ':')
+                                return -EBADMSG;
+                        r = json_scan_value(p, end, depth + 1, &p);
+                        if (r < 0)
+                                return r;
+                        p = json_skip_space_bound(p, end);
+                        if (p >= end)
+                                return -EBADMSG;
+                        if (*p == '}') {
+                                *ret_end = p + 1;
+                                return 0;
+                        }
+                        if (*p++ != ',')
+                                return -EBADMSG;
+                        p = json_skip_space_bound(p, end);
+                }
+        }
+        if (*p == '[') {
+                p = json_skip_space_bound(p + 1, end);
+                if (p < end && *p == ']') {
+                        *ret_end = p + 1;
+                        return 0;
+                }
+                for (;;) {
+                        r = json_scan_value(p, end, depth + 1, &p);
+                        if (r < 0)
+                                return r;
+                        p = json_skip_space_bound(p, end);
+                        if (p >= end)
+                                return -EBADMSG;
+                        if (*p == ']') {
+                                *ret_end = p + 1;
+                                return 0;
+                        }
+                        if (*p++ != ',')
+                                return -EBADMSG;
+                        p = json_skip_space_bound(p, end);
+                }
+        }
+        if (end - p >= 4 && memcmp(p, "true", 4) == 0) {
+                *ret_end = p + 4;
+                return 0;
+        }
+        if (end - p >= 5 && memcmp(p, "false", 5) == 0) {
+                *ret_end = p + 5;
+                return 0;
+        }
+        if (end - p >= 4 && memcmp(p, "null", 4) == 0) {
+                *ret_end = p + 4;
+                return 0;
+        }
+        return json_scan_number(p, end, ret_end);
+}
+
+static int json_object_field(
+                const char *object,
+                const char *object_end,
+                const char *field,
+                const char **ret_begin,
+                const char **ret_end) {
+
+        const char *p, *key_begin, *key_end, *value_begin, *value_end;
+        size_t field_size = strlen(field);
+        int r;
+
+        p = json_skip_space_bound(object, object_end);
+        if (p >= object_end || *p++ != '{')
+                return -EBADMSG;
+        p = json_skip_space_bound(p, object_end);
+        if (p < object_end && *p == '}')
+                return 0;
+
+        for (;;) {
+                key_begin = p;
+                r = json_scan_string(p, object_end, &key_end);
+                if (r < 0)
+                        return r;
+                p = json_skip_space_bound(key_end, object_end);
+                if (p >= object_end || *p++ != ':')
+                        return -EBADMSG;
+                value_begin = json_skip_space_bound(p, object_end);
+                r = json_scan_value(value_begin, object_end, 1, &value_end);
+                if (r < 0)
+                        return r;
+
+                if ((size_t) (key_end - key_begin) == field_size + 2 &&
+                    memcmp(key_begin + 1, field, field_size) == 0) {
+                        *ret_begin = value_begin;
+                        *ret_end = value_end;
+                        return 1;
+                }
+
+                p = json_skip_space_bound(value_end, object_end);
+                if (p >= object_end)
+                        return -EBADMSG;
+                if (*p == '}')
+                        return 0;
+                if (*p++ != ',')
+                        return -EBADMSG;
+                p = json_skip_space_bound(p, object_end);
+        }
+}
+
+static unsigned json_hex_value(char c) {
+        if (c >= '0' && c <= '9')
+                return (unsigned) (c - '0');
+        if (c >= 'a' && c <= 'f')
+                return (unsigned) (c - 'a' + 10);
+        return (unsigned) (c - 'A' + 10);
+}
+
+static uint32_t json_unicode_escape(const char *p) {
+        return (json_hex_value(p[0]) << 12) |
+               (json_hex_value(p[1]) << 8) |
+               (json_hex_value(p[2]) << 4) |
+               json_hex_value(p[3]);
+}
+
+static int utf8_append(char **p, uint32_t codepoint) {
+        if (codepoint <= 0x7f)
+                *((*p)++) = (char) codepoint;
+        else if (codepoint <= 0x7ff) {
+                *((*p)++) = (char) (0xc0 | codepoint >> 6);
+                *((*p)++) = (char) (0x80 | (codepoint & 0x3f));
+        } else if (codepoint <= 0xffff) {
+                *((*p)++) = (char) (0xe0 | codepoint >> 12);
+                *((*p)++) = (char) (0x80 | ((codepoint >> 6) & 0x3f));
+                *((*p)++) = (char) (0x80 | (codepoint & 0x3f));
+        } else {
+                *((*p)++) = (char) (0xf0 | codepoint >> 18);
+                *((*p)++) = (char) (0x80 | ((codepoint >> 12) & 0x3f));
+                *((*p)++) = (char) (0x80 | ((codepoint >> 6) & 0x3f));
+                *((*p)++) = (char) (0x80 | (codepoint & 0x3f));
+        }
+        return 0;
+}
+
+static int json_decode_string(const char *begin, const char *end, char **ret) {
+        char *decoded, *q;
+        const char *p;
+
+        if (begin >= end || *begin != '"' || end[-1] != '"')
+                return -EBADMSG;
+        decoded = malloc((size_t) (end - begin));
+        if (!decoded)
+                return -ENOMEM;
+
+        q = decoded;
+        for (p = begin + 1; p < end - 1; p++) {
+                uint32_t codepoint;
+
+                if (*p != '\\') {
+                        *(q++) = *p;
+                        continue;
+                }
+                p++;
+                switch (*p) {
+                case '"': case '\\': case '/': *(q++) = *p; break;
+                case 'b': *(q++) = '\b'; break;
+                case 'f': *(q++) = '\f'; break;
+                case 'n': *(q++) = '\n'; break;
+                case 'r': *(q++) = '\r'; break;
+                case 't': *(q++) = '\t'; break;
+                case 'u':
+                        codepoint = json_unicode_escape(p + 1);
+                        p += 4;
+                        if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
+                                uint32_t low;
+
+                                if (end - p < 7 || p[1] != '\\' || p[2] != 'u') {
+                                        free(decoded);
+                                        return -EBADMSG;
+                                }
+                                low = json_unicode_escape(p + 3);
+                                if (low < 0xdc00 || low > 0xdfff) {
+                                        free(decoded);
+                                        return -EBADMSG;
+                                }
+                                codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
+                                p += 6;
+                        } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) {
+                                free(decoded);
+                                return -EBADMSG;
+                        }
+                        utf8_append(&q, codepoint);
+                        break;
+                default:
+                        free(decoded);
+                        return -EBADMSG;
+                }
+        }
+        *q = 0;
+        *ret = decoded;
+        return 0;
+}
+
+static int json_object_string_field(const char *object, const char *object_end, const char *field, char **ret) {
+        const char *begin, *end;
+        int r;
+
+        r = json_object_field(object, object_end, field, &begin, &end);
+        if (r <= 0)
+                return r;
+        r = json_decode_string(begin, end, ret);
+        return r < 0 ? r : 1;
+}
+
+static int json_validate_document(const char *json, const char **ret_end) {
+        const char *end, *p;
+        int r;
+
+        end = json + strlen(json);
+        r = json_scan_value(json, end, 0, &p);
+        if (r < 0)
+                return r;
+        p = json_skip_space_bound(p, end);
+        if (p != end)
+                return -EBADMSG;
+        if (ret_end)
+                *ret_end = p;
+        return 0;
+}
+
+static int snapshot_property_append(
+                Systemd1BrokerBackendProperty **properties,
+                size_t *n_properties,
+                const char *object,
+                const char *object_end) {
+
+        Systemd1BrokerBackendProperty property = {
+                .size = sizeof(Systemd1BrokerBackendProperty),
+        };
+        Systemd1BrokerBackendProperty *p;
+        const char *value_begin, *value_end;
+        int r;
+
+        if (*n_properties >= MAX_SNAPSHOT_PROPERTIES)
+                return -E2BIG;
+
+        r = json_object_string_field(object, object_end, "interface", (char**) &property.interface);
+        if (r <= 0)
+                return r < 0 ? r : -EBADMSG;
+        r = json_object_string_field(object, object_end, "name", (char**) &property.name);
+        if (r <= 0) {
+                r = r < 0 ? r : -EBADMSG;
+                goto fail;
+        }
+        r = json_object_string_field(object, object_end, "signature", (char**) &property.signature);
+        if (r <= 0) {
+                r = r < 0 ? r : -EBADMSG;
+                goto fail;
+        }
+        r = json_object_field(object, object_end, "value", &value_begin, &value_end);
+        if (r <= 0) {
+                r = r < 0 ? r : -EBADMSG;
+                goto fail;
+        }
+        property.value_json = strndup(value_begin, (size_t) (value_end - value_begin));
+        if (!property.value_json) {
+                r = -ENOMEM;
+                goto fail;
+        }
+        if (!property.interface[0] || !property.name[0] || !property.signature[0]) {
+                r = -EBADMSG;
+                goto fail;
+        }
+
+        p = realloc(*properties, (*n_properties + 1) * sizeof(Systemd1BrokerBackendProperty));
+        if (!p) {
+                r = -ENOMEM;
+                goto fail;
+        }
+        *properties = p;
+        (*properties)[(*n_properties)++] = property;
+        return 0;
+
+fail:
+        free((char*) property.interface);
+        free((char*) property.name);
+        free((char*) property.signature);
+        free((char*) property.value_json);
+        return r;
+}
+
+static int snapshot_properties_parse(
+                const char *array_begin,
+                const char *array_end,
+                Systemd1BrokerBackendProperty **ret_properties,
+                size_t *ret_n_properties) {
+
+        Systemd1BrokerBackendProperty *properties = NULL;
+        const char *p, *value_end;
+        size_t n_properties = 0;
+        int r;
+
+        *ret_properties = NULL;
+        *ret_n_properties = 0;
+
+        p = json_skip_space_bound(array_begin, array_end);
+        if (p >= array_end || *p++ != '[')
+                return -EBADMSG;
+        p = json_skip_space_bound(p, array_end);
+        if (p < array_end && *p == ']')
+                goto success;
+
+        for (;;) {
+                p = json_skip_space_bound(p, array_end);
+                if (p >= array_end || *p != '{') {
+                        r = -EBADMSG;
+                        goto fail;
+                }
+                r = json_scan_value(p, array_end, 1, &value_end);
+                if (r < 0)
+                        goto fail;
+                r = snapshot_property_append(&properties, &n_properties, p, value_end);
+                if (r < 0)
+                        goto fail;
+                p = json_skip_space_bound(value_end, array_end);
+                if (p >= array_end) {
+                        r = -EBADMSG;
+                        goto fail;
+                }
+                if (*p == ']')
+                        break;
+                if (*p++ != ',') {
+                        r = -EBADMSG;
+                        goto fail;
+                }
+        }
+
+success:
+        *ret_properties = properties;
+        *ret_n_properties = n_properties;
+        return 0;
+
+fail:
+        for (size_t i = 0; i < n_properties; i++) {
+                free((char*) properties[i].interface);
+                free((char*) properties[i].name);
+                free((char*) properties[i].signature);
+                free((char*) properties[i].value_json);
+        }
+        free(properties);
+        *ret_properties = NULL;
+        *ret_n_properties = 0;
+        return r;
+}
+
 static int json_string(const char *json, const char *field, char **ret) {
         char *pattern = NULL, *value = NULL;
         const char *p, *q;
@@ -663,6 +1208,102 @@ static int state_from_snapshot(const char *body, Systemd1BrokerBackendState *ret
         return 0;
 }
 
+static void servicectl_free_unit_snapshot(void *userdata, Systemd1BrokerBackendUnitSnapshot *snapshot) {
+        Systemd1BrokerBackendProperty *properties;
+
+        if (!snapshot)
+                return;
+
+        properties = (Systemd1BrokerBackendProperty*) snapshot->properties;
+        for (size_t i = 0; i < snapshot->n_properties; i++) {
+                free((char*) properties[i].interface);
+                free((char*) properties[i].name);
+                free((char*) properties[i].signature);
+                free((char*) properties[i].value_json);
+        }
+        free(properties);
+        free((char*) snapshot->description);
+        free(snapshot);
+}
+
+static int servicectl_get_unit_snapshot(
+                void *userdata,
+                const char *unit_name,
+                const Systemd1BrokerBackendUnitExtra *extra,
+                Systemd1BrokerBackendUnitSnapshot **ret_snapshot) {
+
+        Systemd1BrokerBackendUnitSnapshot *snapshot = NULL;
+        Systemd1BrokerBackendProperty *properties = NULL;
+        const char *body_end, *properties_begin, *properties_end, *unit_begin, *unit_end;
+        char *body = NULL, *unit_json = NULL;
+        size_t n_properties = 0;
+        int r;
+
+        if (!unit_name || !extra || extra->size < sizeof(Systemd1BrokerBackendUnitExtra) || !ret_snapshot)
+                return -EINVAL;
+        *ret_snapshot = NULL;
+
+        r = query_servicectl_unit(unit_name, &body);
+        if (r < 0)
+                return r;
+
+        snapshot = calloc(1, sizeof(Systemd1BrokerBackendUnitSnapshot));
+        if (!snapshot) {
+                free(body);
+                return -ENOMEM;
+        }
+        snapshot->size = sizeof(Systemd1BrokerBackendUnitSnapshot);
+        if (r == 0) {
+                snapshot->state = SYSTEMD1_BROKER_BACKEND_ABSENT;
+                *ret_snapshot = snapshot;
+                return 0;
+        }
+
+        r = json_validate_document(body, &body_end);
+        if (r < 0)
+                goto fail;
+        r = json_object_field(body, body_end, "unit", &unit_begin, &unit_end);
+        if (r <= 0) {
+                r = r < 0 ? r : -EBADMSG;
+                goto fail;
+        }
+        unit_json = strndup(unit_begin, (size_t) (unit_end - unit_begin));
+        if (!unit_json) {
+                r = -ENOMEM;
+                goto fail;
+        }
+        r = state_from_snapshot(unit_json, &snapshot->state);
+        if (r < 0)
+                goto fail;
+        r = json_object_string_field(unit_begin, unit_end, "description", (char**) &snapshot->description);
+        if (r < 0)
+                goto fail;
+
+        r = json_object_field(body, body_end, "systemd_properties", &properties_begin, &properties_end);
+        if (r <= 0) {
+                r = r < 0 ? r : -EBADMSG;
+                goto fail;
+        }
+        r = snapshot_properties_parse(properties_begin, properties_end, &properties, &n_properties);
+        if (r < 0)
+                goto fail;
+        snapshot->properties = properties;
+        snapshot->n_properties = n_properties;
+
+        free(unit_json);
+        free(body);
+        *ret_snapshot = snapshot;
+        return 0;
+
+fail:
+        free(unit_json);
+        free(body);
+        snapshot->properties = properties;
+        snapshot->n_properties = n_properties;
+        servicectl_free_unit_snapshot(NULL, snapshot);
+        return r;
+}
+
 static void servicectl_free_units(void *userdata, Systemd1BrokerBackendUnit *units, size_t n_units) {
         if (!units)
                 return;
@@ -864,6 +1505,8 @@ __attribute__((visibility("default"))) const Systemd1BrokerBackendOps* systemd1_
                 .stop = servicectl_stop,
                 .list_units = servicectl_list_units,
                 .free_units = servicectl_free_units,
+                .get_unit_snapshot = servicectl_get_unit_snapshot,
+                .free_unit_snapshot = servicectl_free_unit_snapshot,
         };
 
         return &ops;

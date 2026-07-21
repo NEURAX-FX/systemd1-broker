@@ -134,7 +134,7 @@ int systemd1_broker_manager_new(Systemd1BrokerManager **ret) {
 
 static int systemd1_broker_backend_ops_verify(const Systemd1BrokerBackendOps *ops) {
         if (!ops || ops->size < sizeof(Systemd1BrokerBackendOps) || !ops->status || !ops->start || !ops->stop ||
-            !ops->list_units || !ops->free_units)
+            !ops->list_units || !ops->free_units || !ops->get_unit_snapshot || !ops->free_unit_snapshot)
                 return -EINVAL;
 
         return 0;

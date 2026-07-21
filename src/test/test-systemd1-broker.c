@@ -87,11 +87,14 @@ typedef struct TestBackendContext {
         unsigned start_calls;
         unsigned stop_calls;
         unsigned list_calls;
+        unsigned snapshot_calls;
         const char *last_unit_name;
         Systemd1BrokerBackendState status_state;
         const Systemd1BrokerBackendUnit *units;
         size_t n_units;
         int list_error;
+        const Systemd1BrokerBackendUnitSnapshot *snapshot;
+        int snapshot_error;
 } TestBackendContext;
 
 static void test_backend_free_units(void *userdata, Systemd1BrokerBackendUnit *units, size_t n_units) {
@@ -125,6 +128,65 @@ static int test_backend_list_units(void *userdata, Systemd1BrokerBackendUnit **r
 
         *ret_units = units;
         *ret_n_units = context->n_units;
+        return 0;
+}
+
+static void test_backend_free_unit_snapshot(void *userdata, Systemd1BrokerBackendUnitSnapshot *snapshot) {
+        Systemd1BrokerBackendProperty *properties;
+
+        if (!snapshot)
+                return;
+
+        properties = (Systemd1BrokerBackendProperty*) snapshot->properties;
+        for (size_t i = 0; i < snapshot->n_properties; i++) {
+                free((char*) properties[i].interface);
+                free((char*) properties[i].name);
+                free((char*) properties[i].signature);
+                free((char*) properties[i].value_json);
+        }
+        free(properties);
+        free((char*) snapshot->description);
+        free(snapshot);
+}
+
+static int test_backend_get_unit_snapshot(
+                void *userdata,
+                const char *unit_name,
+                const Systemd1BrokerBackendUnitExtra *extra,
+                Systemd1BrokerBackendUnitSnapshot **ret_snapshot) {
+
+        TestBackendContext *context = ASSERT_PTR(userdata);
+        const Systemd1BrokerBackendUnitSnapshot *source = context->snapshot;
+        Systemd1BrokerBackendUnitSnapshot *snapshot;
+        Systemd1BrokerBackendProperty *properties = NULL;
+
+        context->snapshot_calls++;
+        context->last_unit_name = unit_name;
+        ASSERT_NOT_NULL(extra);
+        if (context->snapshot_error < 0)
+                return context->snapshot_error;
+
+        snapshot = new0(Systemd1BrokerBackendUnitSnapshot, 1);
+        ASSERT_NOT_NULL(snapshot);
+        snapshot->size = sizeof(Systemd1BrokerBackendUnitSnapshot);
+        snapshot->state = source ? source->state : context->status_state;
+        if (source && source->description)
+                snapshot->description = ASSERT_PTR(strdup(source->description));
+        if (source && source->n_properties > 0) {
+                properties = new0(Systemd1BrokerBackendProperty, source->n_properties);
+                ASSERT_NOT_NULL(properties);
+                for (size_t i = 0; i < source->n_properties; i++) {
+                        properties[i].size = sizeof(Systemd1BrokerBackendProperty);
+                        properties[i].interface = ASSERT_PTR(strdup(source->properties[i].interface));
+                        properties[i].name = ASSERT_PTR(strdup(source->properties[i].name));
+                        properties[i].signature = ASSERT_PTR(strdup(source->properties[i].signature));
+                        properties[i].value_json = ASSERT_PTR(strdup(source->properties[i].value_json));
+                }
+                snapshot->properties = properties;
+                snapshot->n_properties = source->n_properties;
+        }
+
+        *ret_snapshot = snapshot;
         return 0;
 }
 
@@ -180,6 +242,8 @@ static int test_backend_stop(void *userdata, const char *unit_name, const System
                 .stop = test_backend_stop,                            \
                 .list_units = test_backend_list_units,                \
                 .free_units = test_backend_free_units,                \
+                .get_unit_snapshot = test_backend_get_unit_snapshot,  \
+                .free_unit_snapshot = test_backend_free_unit_snapshot, \
         }
 
 static int match_job_new(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
