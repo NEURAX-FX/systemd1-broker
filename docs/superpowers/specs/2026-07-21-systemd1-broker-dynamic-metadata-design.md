@@ -333,19 +333,28 @@ The response contains one existing `UnitSnapshot` plus a typed property array:
 ```
 
 The endpoint normalizes one optional `.service` suffix and rejects other unit
-types in this implementation. It parses the unit and collects runtime state once
-per request. Existing `/v1/units` catalog behavior remains unchanged so catalog
-enumeration does not carry large execution-property payloads.
+types in this implementation. It parses the unit, collects runtime state, and
+queries the cgroup tracker at most once each per request. Existing `/v1/units`
+catalog behavior remains unchanged so catalog enumeration does not carry large
+execution-property payloads.
 
 The servicectl `source_path` field names the regular unit fragment. It maps to
 systemd's `FragmentPath`. It does not map to systemd's `SourcePath`, whose
 meaning is the origin from which a unit was generated or converted. The backend
 publishes `SourcePath` only if servicectl later exposes that distinct concept.
 
+The cgroup tracker is the authoritative source for `Unit.ControlGroup`.
+Servicectl converts a tracked filesystem path such as
+`/sys/fs/cgroup/servicectl.slice/system/example` to systemd's hierarchy-relative
+form `/servicectl.slice/system/example`. It publishes only clean absolute paths
+inside the cgroup v2 root. An unavailable tracker, an untracked unit, or an
+out-of-root path omits the optional property instead of deriving or fabricating
+one from the unit name or PID.
+
 The initial servicectl property set is:
 
-1. Unit: `FragmentPath`, `UnitFileState`, `Requires`, `Wants`, `Before`, and
-   `After` when each has a reliable source.
+1. Unit: `FragmentPath`, `ControlGroup`, `UnitFileState`, `Requires`, `Wants`,
+   `Before`, and `After` when each has a reliable source.
 2. Service: `MainPID`, `ExecMainPID`, `StatusText`, `Result`, `Type`,
    `ExecStart`, `WorkingDirectory`, `User`, and `Group` when each has a reliable
    source and can be encoded with the standard systemd signature.
@@ -379,9 +388,10 @@ sd-bus messages or link against libsystemd.
 Servicectl tests verify:
 
 1. the per-unit endpoint returns one normalized unit;
-2. real source path and PID values become typed properties;
+2. real source path, cgroup path, and PID values become typed properties;
 3. unavailable values are omitted rather than encoded as empty or zero;
-4. dependencies and service execution fields use their standard signatures;
+4. cgroup, dependency, and service execution fields use their standard
+   signatures and hierarchy semantics;
 5. invalid names and missing units return the expected HTTP status;
 6. `/v1/units` catalog responses remain unchanged.
 
