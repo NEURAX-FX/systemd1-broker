@@ -23,7 +23,7 @@ extern char **environ;
 #define DEFAULT_SYSVISION_SOCKET "/run/servicectl/sysvision/sysvisiond.sock"
 #define DEFAULT_SERVICECTL_SOCKET "/run/servicectl/servicectl.sock"
 #define DEFAULT_SERVICECTL_RUNTIME "/run/servicectl/managed"
-#define MAX_SYSVISION_RESPONSE_SIZE (1024U * 1024U)
+#define MAX_HTTP_RESPONSE_SIZE (1024U * 1024U)
 #define MAX_SNAPSHOT_PROPERTIES 256U
 #define MAX_JSON_DEPTH 64U
 #define SYSVISION_IO_TIMEOUT_SEC 5
@@ -256,13 +256,13 @@ static int read_all(int fd, char **ret) {
         for (;;) {
                 ssize_t n;
 
-                if (allocated - size < 4096 && allocated < MAX_SYSVISION_RESPONSE_SIZE + 2) {
+                if (allocated - size < 4096 && allocated < MAX_HTTP_RESPONSE_SIZE + 2) {
                         char *p;
                         size_t new_allocated;
 
                         new_allocated = allocated > 0 ? allocated * 2 : 8192;
-                        if (new_allocated > MAX_SYSVISION_RESPONSE_SIZE + 2)
-                                new_allocated = MAX_SYSVISION_RESPONSE_SIZE + 2;
+                        if (new_allocated > MAX_HTTP_RESPONSE_SIZE + 2)
+                                new_allocated = MAX_HTTP_RESPONSE_SIZE + 2;
                         p = realloc(buffer, new_allocated);
                         if (!p) {
                                 free(buffer);
@@ -283,7 +283,7 @@ static int read_all(int fd, char **ret) {
                         break;
 
                 size += (size_t) n;
-                if (size > MAX_SYSVISION_RESPONSE_SIZE) {
+                if (size > MAX_HTTP_RESPONSE_SIZE) {
                         free(buffer);
                         return -E2BIG;
                 }
@@ -297,6 +297,161 @@ static int read_all(int fd, char **ret) {
         buffer[size] = 0;
         *ret = buffer;
         return 0;
+}
+
+static bool http_transfer_encoding_is_chunked(const char *response, const char *header_end) {
+        const char *line;
+
+        line = strstr(response, "\r\n");
+        if (!line || line >= header_end)
+                return false;
+        line += 2;
+
+        while (line < header_end) {
+                const char *colon, *line_end, *p;
+
+                line_end = strstr(line, "\r\n");
+                if (!line_end || line_end > header_end)
+                        return false;
+                colon = memchr(line, ':', (size_t) (line_end - line));
+                if (!colon || (size_t) (colon - line) != strlen("Transfer-Encoding") ||
+                    strncasecmp(line, "Transfer-Encoding", strlen("Transfer-Encoding")) != 0) {
+                        line = line_end + 2;
+                        continue;
+                }
+
+                p = colon + 1;
+                while (p < line_end) {
+                        const char *token_end;
+
+                        while (p < line_end && strchr(" \t,", *p))
+                                p++;
+                        token_end = p;
+                        while (token_end < line_end && !strchr(" \t,;", *token_end))
+                                token_end++;
+                        if ((size_t) (token_end - p) == strlen("chunked") &&
+                            strncasecmp(p, "chunked", strlen("chunked")) == 0)
+                                return true;
+                        p = token_end;
+                        while (p < line_end && *p != ',')
+                                p++;
+                }
+                return false;
+        }
+
+        return false;
+}
+
+static int http_chunk_size(const char *line, const char *line_end, size_t *ret) {
+        size_t size = 0;
+        bool any = false;
+
+        for (const char *p = line; p < line_end && *p != ';'; p++) {
+                unsigned digit;
+
+                if (*p >= '0' && *p <= '9')
+                        digit = (unsigned) (*p - '0');
+                else if (*p >= 'a' && *p <= 'f')
+                        digit = (unsigned) (*p - 'a' + 10);
+                else if (*p >= 'A' && *p <= 'F')
+                        digit = (unsigned) (*p - 'A' + 10);
+                else
+                        return -EBADMSG;
+                if (size > (SIZE_MAX - digit) / 16)
+                        return -E2BIG;
+                size = size * 16 + digit;
+                any = true;
+        }
+        if (!any)
+                return -EBADMSG;
+
+        *ret = size;
+        return 0;
+}
+
+static int http_dechunk(const char *body, char **ret) {
+        char *decoded = NULL;
+        const char *end, *p;
+        size_t decoded_size = 0;
+        int r;
+
+        end = body + strlen(body);
+        decoded = malloc((size_t) (end - body) + 1);
+        if (!decoded)
+                return -ENOMEM;
+        p = body;
+
+        for (;;) {
+                const char *line_end;
+                size_t chunk_size;
+
+                line_end = strstr(p, "\r\n");
+                if (!line_end || line_end > end) {
+                        r = -EBADMSG;
+                        goto fail;
+                }
+                r = http_chunk_size(p, line_end, &chunk_size);
+                if (r < 0)
+                        goto fail;
+                p = line_end + 2;
+
+                if (chunk_size == 0) {
+                        for (;;) {
+                                bool empty;
+
+                                line_end = strstr(p, "\r\n");
+                                if (!line_end || line_end > end) {
+                                        r = -EBADMSG;
+                                        goto fail;
+                                }
+                                empty = line_end == p;
+                                p = line_end + 2;
+                                if (empty)
+                                        break;
+                        }
+                        if (p != end) {
+                                r = -EBADMSG;
+                                goto fail;
+                        }
+                        decoded[decoded_size] = 0;
+                        *ret = decoded;
+                        return 0;
+                }
+                if (chunk_size > (size_t) (end - p)) {
+                        r = -EBADMSG;
+                        goto fail;
+                }
+                if (chunk_size > MAX_HTTP_RESPONSE_SIZE - decoded_size) {
+                        r = -E2BIG;
+                        goto fail;
+                }
+                memcpy(decoded + decoded_size, p, chunk_size);
+                decoded_size += chunk_size;
+                p += chunk_size;
+                if (end - p < 2 || p[0] != '\r' || p[1] != '\n') {
+                        r = -EBADMSG;
+                        goto fail;
+                }
+                p += 2;
+        }
+
+fail:
+        free(decoded);
+        return r;
+}
+
+static int http_response_body(const char *response, char **ret) {
+        const char *body, *header_end;
+
+        header_end = strstr(response, "\r\n\r\n");
+        if (!header_end)
+                return -EBADMSG;
+        body = header_end + 4;
+        if (http_transfer_encoding_is_chunked(response, header_end))
+                return http_dechunk(body, ret);
+
+        *ret = strdup(body);
+        return *ret ? 0 : -ENOMEM;
 }
 
 static int unit_query_name(const char *unit_name, char **ret) {
@@ -317,7 +472,7 @@ static int unit_query_name(const char *unit_name, char **ret) {
 }
 
 static int query_sysvision(const char *unit_name, char **ret_body) {
-        char *name = NULL, *request = NULL, *response = NULL, *body;
+        char *name = NULL, *request = NULL, *response = NULL;
         int fd = -1, status, r;
 
         r = unit_query_name(unit_name, &name);
@@ -361,15 +516,9 @@ static int query_sysvision(const char *unit_name, char **ret_body) {
                 goto finish;
         }
 
-        body = strstr(response, "\r\n\r\n");
-        if (!body) {
-                r = -EBADMSG;
-                goto finish;
-        }
-        body += 4;
-
-        *ret_body = strdup(body);
-        r = *ret_body ? 1 : -ENOMEM;
+        r = http_response_body(response, ret_body);
+        if (r >= 0)
+                r = 1;
 
 finish:
         if (fd >= 0)
@@ -385,7 +534,7 @@ static int query_servicectl_units(char **ret_body) {
                 "GET /v1/units?all=1 HTTP/1.1\r\n"
                 "Host: localhost\r\n"
                 "Connection: close\r\n\r\n";
-        char *response = NULL, *body;
+        char *response = NULL;
         int fd = -1, status, r;
 
         fd = connect_unix(servicectl_socket_path());
@@ -412,14 +561,7 @@ static int query_servicectl_units(char **ret_body) {
                 goto finish;
         }
 
-        body = strstr(response, "\r\n\r\n");
-        if (!body) {
-                r = -EBADMSG;
-                goto finish;
-        }
-        body += 4;
-        *ret_body = strdup(body);
-        r = *ret_body ? 0 : -ENOMEM;
+        r = http_response_body(response, ret_body);
 
 finish:
         close(fd);
@@ -455,7 +597,7 @@ static int url_encode_path_segment(const char *value, char **ret) {
 }
 
 static int query_servicectl_unit(const char *unit_name, char **ret_body) {
-        char *encoded = NULL, *request = NULL, *response = NULL, *body;
+        char *encoded = NULL, *request = NULL, *response = NULL;
         int fd = -1, status, r;
 
         r = url_encode_path_segment(unit_name, &encoded);
@@ -497,14 +639,9 @@ static int query_servicectl_unit(const char *unit_name, char **ret_body) {
                 goto finish;
         }
 
-        body = strstr(response, "\r\n\r\n");
-        if (!body) {
-                r = -EBADMSG;
-                goto finish;
-        }
-        body += 4;
-        *ret_body = strdup(body);
-        r = *ret_body ? 1 : -ENOMEM;
+        r = http_response_body(response, ret_body);
+        if (r >= 0)
+                r = 1;
 
 finish:
         if (fd >= 0)

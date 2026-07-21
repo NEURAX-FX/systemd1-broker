@@ -72,6 +72,22 @@ static void http_stub_done(HTTPStub *stub) {
         stub->listen_fd = safe_close(stub->listen_fd);
 }
 
+static int make_chunked_response(const char *body, size_t split, char **ret) {
+        size_t size;
+
+        assert(body);
+        assert(ret);
+
+        size = strlen(body);
+        split = MIN(split, size);
+        if (asprintf(ret,
+                     "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                     "%zx\r\n%.*s\r\n%zx\r\n%s\r\n0\r\n\r\n",
+                     split, (int) split, body, size - split, body + split) < 0)
+                return -ENOMEM;
+        return 0;
+}
+
 static const Systemd1BrokerBackendOps* load_backend(void **ret_dl) {
         const Systemd1BrokerBackendOps* (*entrypoint)(void);
         const Systemd1BrokerBackendOps *ops;
@@ -117,9 +133,7 @@ TEST(list_units_uses_servicectl_api) {
         socket_path = path_join(tmp, "servicectl.sock");
         ASSERT_NOT_NULL(socket_path);
         ASSERT_OK_ERRNO(setenv("SYSTEMD1_BROKER_SERVICECTL_SOCKET", socket_path, true));
-        ASSERT_OK(asprintf(&response,
-                           "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
-                           strlen(body), body));
+        ASSERT_OK(make_chunked_response(body, 47, &response));
         ops = load_backend(&dl);
 
         http_stub_start(&stub, socket_path, response);
@@ -158,9 +172,7 @@ TEST(list_units_rejects_duplicate_catalog) {
         socket_path = path_join(tmp, "servicectl.sock");
         ASSERT_NOT_NULL(socket_path);
         ASSERT_OK_ERRNO(setenv("SYSTEMD1_BROKER_SERVICECTL_SOCKET", socket_path, true));
-        ASSERT_OK(asprintf(&response,
-                           "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
-                           strlen(body), body));
+        ASSERT_OK(make_chunked_response(body, 83, &response));
         ops = load_backend(&dl);
 
         http_stub_start(&stub, socket_path, response);
@@ -228,9 +240,7 @@ TEST(get_unit_snapshot_uses_servicectl_api) {
         socket_path = path_join(tmp, "servicectl.sock");
         ASSERT_NOT_NULL(socket_path);
         ASSERT_OK_ERRNO(setenv("SYSTEMD1_BROKER_SERVICECTL_SOCKET", socket_path, true));
-        ASSERT_OK(asprintf(&response,
-                           "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
-                           strlen(body), body));
+        ASSERT_OK(make_chunked_response(body, 109, &response));
         ops = load_backend(&dl);
 
         http_stub_start(&stub, socket_path, response);
@@ -406,9 +416,7 @@ TEST(status_uses_sysvision_api) {
                 HTTPStub stub;
                 Systemd1BrokerBackendState state = _SYSTEMD1_BROKER_BACKEND_STATE_INVALID;
 
-                ASSERT_OK(asprintf(&response,
-                                   "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
-                                   strlen(test->body), test->body));
+                ASSERT_OK(make_chunked_response(test->body, 11, &response));
                 http_stub_start(&stub, socket_path, response);
                 ASSERT_OK(ops->status(ops->userdata, "demo.service", &extra, &state));
                 http_stub_done(&stub);
