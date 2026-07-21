@@ -168,10 +168,16 @@ interface and name must be unique within a snapshot.
 The following values remain broker-owned and cannot be overridden by a backend:
 
 1. `Unit.Id` and `Unit.Names`;
-2. `Unit.LoadState`;
-3. `Unit.ActiveState` and `Unit.SubState`;
-4. `Unit.Job`;
-5. methods and signals on either interface.
+2. `Unit.Description`;
+3. `Unit.LoadState`;
+4. `Unit.ActiveState` and `Unit.SubState`;
+5. `Unit.Job`;
+6. methods and signals on either interface.
+
+These are the only properties that the broker always emits. Values such as
+`Following`, `NeedDaemonReload`, and `InvocationID` are optional systemd
+metadata, not broker-owned facts, and are omitted unless a backend provides a
+valid typed value.
 
 The broker does not maintain a property-name whitelist beyond these interface
 and reserved-name rules. A trusted backend may therefore publish a newly added
@@ -186,6 +192,13 @@ unit provides a value. This preserves the D-Bus rule that one property on one
 interface has a stable type. A snapshot that conflicts with an established
 signature is rejected as a whole. Registering new schema keys and replacing the
 unit snapshot are prepared and committed atomically.
+
+Because `GetAll("")` combines Unit and Service properties into one `a{sv}` whose
+keys contain no interface qualifier, accepted dynamic properties must also have
+unique member names across both interfaces. A property name that collides with a
+broker-owned core name is treated as a reserved override and dropped. Two
+accepted dynamic properties with the same member name but different interfaces
+reject the snapshot as a whole.
 
 An unsupported interface, reserved override, invalid member name, or unsupported
 signature is dropped with a rate-limited diagnostic. Duplicate keys, malformed
@@ -208,7 +221,7 @@ value. In particular, it does not publish `MainPID=0`, an empty
 
 For a generic `Properties.GetAll` request, the broker emits:
 
-1. its required core properties;
+1. its seven required core properties;
 2. the optional backend properties present in the current cached snapshot.
 
 Missing optional properties are not included. This is what makes default
