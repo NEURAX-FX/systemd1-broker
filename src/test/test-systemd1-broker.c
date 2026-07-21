@@ -18,6 +18,7 @@
 #include "systemd1-broker-backend-api.h"
 #include "systemd1-broker-bus.h"
 #include "systemd1-broker-dbus.h"
+#include "systemd1-broker-metadata.h"
 #include "systemd1-broker.h"
 #include "tests.h"
 #include "time-util.h"
@@ -41,6 +42,7 @@ typedef struct UnitPropertiesChangedSignal {
         char *sub_state;
         uint32_t job_id;
         char *job_path;
+        char **invalidated;
 } UnitPropertiesChangedSignal;
 
 typedef struct JobNewSignal {
@@ -67,6 +69,7 @@ static UnitPropertiesChangedSignal* unit_properties_changed_signal_done(UnitProp
         signal->active_state = mfree(signal->active_state);
         signal->sub_state = mfree(signal->sub_state);
         signal->job_path = mfree(signal->job_path);
+        signal->invalidated = strv_free(signal->invalidated);
 
         return NULL;
 }
@@ -88,6 +91,7 @@ typedef struct TestBackendContext {
         unsigned stop_calls;
         unsigned list_calls;
         unsigned snapshot_calls;
+        unsigned snapshot_free_calls;
         const char *last_unit_name;
         Systemd1BrokerBackendState status_state;
         const Systemd1BrokerBackendUnit *units;
@@ -132,10 +136,13 @@ static int test_backend_list_units(void *userdata, Systemd1BrokerBackendUnit **r
 }
 
 static void test_backend_free_unit_snapshot(void *userdata, Systemd1BrokerBackendUnitSnapshot *snapshot) {
+        TestBackendContext *context = ASSERT_PTR(userdata);
         Systemd1BrokerBackendProperty *properties;
 
         if (!snapshot)
                 return;
+
+        context->snapshot_free_calls++;
 
         properties = (Systemd1BrokerBackendProperty*) snapshot->properties;
         for (size_t i = 0; i < snapshot->n_properties; i++) {
@@ -318,7 +325,8 @@ static int match_unit_properties_changed(sd_bus_message *message, void *userdata
                 ASSERT_OK(sd_bus_message_exit_container(message));
         }
         ASSERT_OK(sd_bus_message_exit_container(message));
-        ASSERT_OK(sd_bus_message_skip(message, "as"));
+        signal->invalidated = strv_free(signal->invalidated);
+        ASSERT_OK(sd_bus_message_read_strv(message, &signal->invalidated));
 
         return 0;
 }
@@ -329,6 +337,27 @@ static int new_method_return_message(sd_bus_message **ret) {
         ASSERT_OK(sd_bus_new(&bus));
         bus->state = BUS_RUNNING;
         return sd_bus_message_new(bus, ret, SD_BUS_MESSAGE_METHOD_RETURN);
+}
+
+static int new_property_value_message(const Systemd1BrokerProperty *property, sd_bus_message **ret) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *message = NULL;
+        int r;
+
+        r = new_method_return_message(&message);
+        if (r < 0)
+                return r;
+        r = systemd1_broker_property_append_value(message, property);
+        if (r < 0)
+                return r;
+        r = sd_bus_message_seal(message, 1, 0);
+        if (r < 0)
+                return r;
+        r = sd_bus_message_rewind(message, true);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(message);
+        return 0;
 }
 
 static void* broker_bus_test_server(void *userdata) {
@@ -833,7 +862,7 @@ static int broker_bus_test_client(BrokerBusTestContext *context) {
         ASSERT_TRUE(found_id);
         ASSERT_TRUE(found_description);
         ASSERT_TRUE(found_active_state);
-        ASSERT_TRUE(found_need_daemon_reload);
+        ASSERT_FALSE(found_need_daemon_reload);
         ASSERT_TRUE(found_job);
 
         reply = sd_bus_message_unref(reply);
@@ -910,11 +939,11 @@ static int broker_bus_test_client(BrokerBusTestContext *context) {
                 ASSERT_OK(sd_bus_message_exit_container(reply));
         }
         ASSERT_OK(sd_bus_message_exit_container(reply));
-        ASSERT_TRUE(found_service_main_pid);
-        ASSERT_TRUE(found_service_result);
-        ASSERT_TRUE(found_service_status_errno);
-        ASSERT_TRUE(found_service_start_timestamp);
-        ASSERT_TRUE(found_service_pid_file);
+        ASSERT_FALSE(found_service_main_pid);
+        ASSERT_FALSE(found_service_result);
+        ASSERT_FALSE(found_service_status_errno);
+        ASSERT_FALSE(found_service_start_timestamp);
+        ASSERT_FALSE(found_service_pid_file);
 
         reply = sd_bus_message_unref(reply);
         ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "LoadUnit", &error, &reply, "s", "systemd-timesyncd.service"));
@@ -964,6 +993,242 @@ TEST(dbus_manager_get_unit_and_list_units) {
 
         ASSERT_OK_ERRNO(pthread_create(&server, NULL, broker_bus_test_server, &context));
         ASSERT_OK(broker_bus_test_client(&context));
+        ASSERT_OK_ERRNO(pthread_join(server, &server_result));
+        ASSERT_NULL(server_result);
+}
+
+TEST(dbus_dynamic_unit_properties) {
+        static const Systemd1BrokerBackendProperty properties[] = {
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "FragmentPath",
+                        .signature = "s",
+                        .value_json = "\"/etc/systemd/system/demo.service\"",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Service",
+                        .name = "MainPID",
+                        .signature = "u",
+                        .value_json = "4242",
+                },
+        };
+        static const Systemd1BrokerBackendUnitSnapshot snapshot = {
+                .size = sizeof(Systemd1BrokerBackendUnitSnapshot),
+                .state = SYSTEMD1_BROKER_BACKEND_RUNNING,
+                .description = "Demo Updated",
+                .properties = properties,
+                .n_properties = ELEMENTSOF(properties),
+        };
+        static const Systemd1BrokerBackendProperty changed_properties[] = {
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "UnitFileState",
+                        .signature = "s",
+                        .value_json = "\"enabled\"",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Service",
+                        .name = "MainPID",
+                        .signature = "u",
+                        .value_json = "4242",
+                },
+        };
+        static const Systemd1BrokerBackendUnitSnapshot changed_snapshot = {
+                .size = sizeof(Systemd1BrokerBackendUnitSnapshot),
+                .state = SYSTEMD1_BROKER_BACKEND_RUNNING,
+                .description = "Demo Updated",
+                .properties = changed_properties,
+                .n_properties = ELEMENTSOF(changed_properties),
+        };
+        _cleanup_(systemd1_broker_manager_freep) Systemd1BrokerManager *manager = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_slot_unrefp) sd_bus_slot *properties_slot = NULL;
+        _cleanup_(unit_properties_changed_signal_done) UnitPropertiesChangedSignal properties_changed = {};
+        TestBackendContext backend_context = { .snapshot = &snapshot };
+        const Systemd1BrokerBackendOps backend_ops = TEST_BACKEND_OPS(&backend_context);
+        BrokerBusTestContext context = { .fds = EBADF_PAIR };
+        bool found_id = false, found_description = false, found_fragment = false, found_main_pid = false;
+        bool found_placeholder = false;
+        const char *property, *string, *introspection;
+        pthread_t server;
+        void *server_result;
+        uint32_t main_pid;
+        int fd, r;
+
+        ASSERT_OK(systemd1_broker_manager_new(&manager));
+        ASSERT_OK(systemd1_broker_manager_set_backend(manager, &backend_ops));
+        ASSERT_OK(systemd1_broker_manager_add_unit(manager, "demo.service", "Demo", NULL));
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM, 0, context.fds));
+        context.manager = manager;
+        ASSERT_OK_ERRNO(pthread_create(&server, NULL, broker_bus_test_server, &context));
+
+        ASSERT_OK(sd_bus_new(&bus));
+        fd = TAKE_FD(context.fds[1]);
+        ASSERT_OK(sd_bus_set_fd(bus, fd, fd));
+        ASSERT_OK(sd_bus_start(bus));
+        ASSERT_OK(sd_bus_match_signal(
+                        bus,
+                        &properties_slot,
+                        NULL,
+                        "/org/freedesktop/systemd1/unit/demo_2eservice",
+                        "org.freedesktop.DBus.Properties",
+                        "PropertiesChanged",
+                        match_unit_properties_changed,
+                        &properties_changed));
+
+        ASSERT_OK(sd_bus_call_method(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1/unit/demo_2eservice",
+                        "org.freedesktop.DBus.Properties",
+                        "GetAll",
+                        &error,
+                        &reply,
+                        "s",
+                        ""));
+        ASSERT_EQ(backend_context.snapshot_calls, 1u);
+        ASSERT_OK(sd_bus_message_enter_container(reply, 'a', "{sv}"));
+        while (ASSERT_OK(sd_bus_message_enter_container(reply, 'e', "sv")) > 0) {
+                ASSERT_OK(sd_bus_message_read_basic(reply, 's', &property));
+                if (streq(property, "Id")) {
+                        ASSERT_OK(sd_bus_message_enter_container(reply, 'v', "s"));
+                        ASSERT_OK(sd_bus_message_read(reply, "s", &string));
+                        ASSERT_STREQ(string, "demo.service");
+                        ASSERT_OK(sd_bus_message_exit_container(reply));
+                        found_id = true;
+                } else if (streq(property, "Description")) {
+                        ASSERT_OK(sd_bus_message_enter_container(reply, 'v', "s"));
+                        ASSERT_OK(sd_bus_message_read(reply, "s", &string));
+                        ASSERT_STREQ(string, "Demo Updated");
+                        ASSERT_OK(sd_bus_message_exit_container(reply));
+                        found_description = true;
+                } else if (streq(property, "FragmentPath")) {
+                        ASSERT_OK(sd_bus_message_enter_container(reply, 'v', "s"));
+                        ASSERT_OK(sd_bus_message_read(reply, "s", &string));
+                        ASSERT_STREQ(string, "/etc/systemd/system/demo.service");
+                        ASSERT_OK(sd_bus_message_exit_container(reply));
+                        found_fragment = true;
+                } else if (streq(property, "MainPID")) {
+                        ASSERT_OK(sd_bus_message_enter_container(reply, 'v', "u"));
+                        ASSERT_OK(sd_bus_message_read(reply, "u", &main_pid));
+                        ASSERT_EQ(main_pid, 4242u);
+                        ASSERT_OK(sd_bus_message_exit_container(reply));
+                        found_main_pid = true;
+                } else {
+                        found_placeholder |= STR_IN_SET(property, "Following", "NeedDaemonReload", "InvocationID", "Result");
+                        ASSERT_OK(sd_bus_message_skip(reply, "v"));
+                }
+                ASSERT_OK(sd_bus_message_exit_container(reply));
+        }
+        ASSERT_OK(sd_bus_message_exit_container(reply));
+        ASSERT_TRUE(found_id);
+        ASSERT_TRUE(found_description);
+        ASSERT_TRUE(found_fragment);
+        ASSERT_TRUE(found_main_pid);
+        ASSERT_FALSE(found_placeholder);
+
+        while (ASSERT_OK(sd_bus_process(bus, NULL)) > 0)
+                ;
+        unit_properties_changed_signal_done(&properties_changed);
+
+        backend_context.snapshot = &changed_snapshot;
+        reply = sd_bus_message_unref(reply);
+        ASSERT_OK(sd_bus_call_method(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1/unit/demo_2eservice",
+                        "org.freedesktop.DBus.Properties",
+                        "GetAll",
+                        &error,
+                        &reply,
+                        "s",
+                        "org.freedesktop.systemd1.Unit"));
+        for (unsigned i = 0; i < 20 && !properties_changed.invalidated; i++)
+                ASSERT_OK(sd_bus_process(bus, NULL));
+        ASSERT_STREQ(properties_changed.interface, "org.freedesktop.systemd1.Unit");
+        ASSERT_TRUE(strv_contains(properties_changed.invalidated, "FragmentPath"));
+        ASSERT_TRUE(strv_contains(properties_changed.invalidated, "UnitFileState"));
+        unit_properties_changed_signal_done(&properties_changed);
+
+        reply = sd_bus_message_unref(reply);
+        ASSERT_OK(sd_bus_call_method(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1/unit/demo_2eservice",
+                        "org.freedesktop.DBus.Properties",
+                        "Get",
+                        &error,
+                        &reply,
+                        "ss",
+                        "org.freedesktop.systemd1.Unit",
+                        "DropInPaths"));
+        ASSERT_EQ(backend_context.snapshot_calls, 3u);
+        ASSERT_OK(sd_bus_message_enter_container(reply, 'v', "as"));
+        ASSERT_OK(sd_bus_message_enter_container(reply, 'a', "s"));
+        ASSERT_OK_ZERO(sd_bus_message_read_basic(reply, 's', &string));
+        ASSERT_OK(sd_bus_message_exit_container(reply));
+        ASSERT_OK(sd_bus_message_exit_container(reply));
+
+        reply = sd_bus_message_unref(reply);
+        r = sd_bus_call_method(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1/unit/demo_2eservice",
+                        "org.freedesktop.DBus.Properties",
+                        "Get",
+                        &error,
+                        &reply,
+                        "ss",
+                        "org.freedesktop.systemd1.Unit",
+                        "NeedDaemonReload");
+        ASSERT_LT(r, 0);
+        ASSERT_STREQ(error.name, SD_BUS_ERROR_UNKNOWN_PROPERTY);
+        ASSERT_EQ(backend_context.snapshot_calls, 4u);
+        sd_bus_error_free(&error);
+
+        backend_context.snapshot = &snapshot;
+        backend_context.snapshot_error = -EIO;
+        ASSERT_OK(sd_bus_call_method(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1/unit/demo_2eservice",
+                        "org.freedesktop.DBus.Properties",
+                        "Get",
+                        &error,
+                        &reply,
+                        "ss",
+                        "org.freedesktop.systemd1.Service",
+                        "MainPID"));
+        ASSERT_EQ(backend_context.snapshot_calls, 5u);
+        ASSERT_OK(sd_bus_message_enter_container(reply, 'v', "u"));
+        ASSERT_OK(sd_bus_message_read(reply, "u", &main_pid));
+        ASSERT_EQ(main_pid, 4242u);
+        ASSERT_OK(sd_bus_message_exit_container(reply));
+
+        reply = sd_bus_message_unref(reply);
+        ASSERT_OK(sd_bus_call_method(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1/unit/demo_2eservice",
+                        "org.freedesktop.DBus.Introspectable",
+                        "Introspect",
+                        &error,
+                        &reply,
+                        NULL));
+        ASSERT_EQ(backend_context.snapshot_calls, 6u);
+        ASSERT_OK(sd_bus_message_read(reply, "s", &introspection));
+        ASSERT_TRUE(strstr(introspection, "property name=\"UnitFileState\" type=\"s\""));
+        ASSERT_TRUE(strstr(introspection, "property name=\"MainPID\" type=\"u\""));
+        ASSERT_FALSE(strstr(introspection, "property name=\"FragmentPath\""));
+
+        reply = sd_bus_message_unref(reply);
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd1", "/broker/test", "org.freedesktop.systemd1.BrokerTest", "Exit", &error, NULL, NULL));
         ASSERT_OK_ERRNO(pthread_join(server, &server_result));
         ASSERT_NULL(server_result);
 }
@@ -1310,6 +1575,520 @@ TEST(manager_sync_units_reconciles_complete_catalog) {
         context.list_error = -EIO;
         ASSERT_ERROR(systemd1_broker_manager_sync_units(manager), EIO);
         ASSERT_NOT_NULL(systemd1_broker_manager_get_unit(manager, "gamma.service"));
+}
+
+TEST(manager_refresh_unit_snapshot_replaces_cache_atomically) {
+        static const Systemd1BrokerBackendProperty first_properties[] = {
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "FragmentPath",
+                        .signature = "s",
+                        .value_json = "  \"/etc/systemd/system/demo.service\" ",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Service",
+                        .name = "MainPID",
+                        .signature = "u",
+                        .value_json = "4242",
+                },
+        };
+        static const Systemd1BrokerBackendProperty second_properties[] = {
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Service",
+                        .name = "MainPID",
+                        .signature = "u",
+                        .value_json = "4343",
+                },
+        };
+        static const Systemd1BrokerBackendUnitSnapshot first = {
+                .size = sizeof(Systemd1BrokerBackendUnitSnapshot),
+                .state = SYSTEMD1_BROKER_BACKEND_RUNNING,
+                .description = "Demo Updated",
+                .properties = first_properties,
+                .n_properties = ELEMENTSOF(first_properties),
+        };
+        static const Systemd1BrokerBackendUnitSnapshot second = {
+                .size = sizeof(Systemd1BrokerBackendUnitSnapshot),
+                .state = SYSTEMD1_BROKER_BACKEND_FAILED,
+                .description = "Demo Failed",
+                .properties = second_properties,
+                .n_properties = ELEMENTSOF(second_properties),
+        };
+        _cleanup_(systemd1_broker_manager_freep) Systemd1BrokerManager *manager = NULL;
+        TestBackendContext context = {
+                .snapshot = &first,
+        };
+        const Systemd1BrokerBackendOps ops = TEST_BACKEND_OPS(&context);
+        const Systemd1BrokerProperty *property;
+        Systemd1BrokerUnit *unit;
+        bool changed;
+
+        ASSERT_OK(systemd1_broker_manager_new(&manager));
+        ASSERT_OK(systemd1_broker_manager_set_backend(manager, &ops));
+        ASSERT_OK(systemd1_broker_manager_add_unit(manager, "demo.service", "Demo", &unit));
+
+        ASSERT_OK(systemd1_broker_manager_refresh_unit_snapshot(manager, "demo.service", &changed));
+        ASSERT_TRUE(changed);
+        ASSERT_EQ(context.snapshot_calls, 1u);
+        ASSERT_EQ(context.snapshot_free_calls, 1u);
+        ASSERT_STREQ(systemd1_broker_unit_description(unit), "Demo Updated");
+        ASSERT_STREQ(systemd1_broker_unit_active_state(unit), "active");
+        ASSERT_EQ(systemd1_broker_unit_n_properties(unit), 2u);
+        ASSERT_EQ(systemd1_broker_unit_metadata_generation(unit), 1u);
+        property = ASSERT_PTR(systemd1_broker_unit_find_property(
+                                unit,
+                                "org.freedesktop.systemd1.Unit",
+                                "FragmentPath"));
+        ASSERT_STREQ(systemd1_broker_property_signature(property), "s");
+        ASSERT_STREQ(systemd1_broker_property_value_json(property), "\"/etc/systemd/system/demo.service\"");
+
+        context.snapshot = &second;
+        ASSERT_OK(systemd1_broker_manager_refresh_unit_snapshot(manager, "demo.service", &changed));
+        ASSERT_TRUE(changed);
+        ASSERT_EQ(context.snapshot_calls, 2u);
+        ASSERT_EQ(context.snapshot_free_calls, 2u);
+        ASSERT_STREQ(systemd1_broker_unit_description(unit), "Demo Failed");
+        ASSERT_STREQ(systemd1_broker_unit_active_state(unit), "failed");
+        ASSERT_EQ(systemd1_broker_unit_n_properties(unit), 1u);
+        ASSERT_EQ(systemd1_broker_unit_metadata_generation(unit), 2u);
+        ASSERT_NULL(systemd1_broker_unit_find_property(
+                        unit,
+                        "org.freedesktop.systemd1.Unit",
+                        "FragmentPath"));
+        property = ASSERT_PTR(systemd1_broker_unit_find_property(
+                                unit,
+                                "org.freedesktop.systemd1.Service",
+                                "MainPID"));
+        ASSERT_STREQ(systemd1_broker_property_value_json(property), "4343");
+
+        ASSERT_OK(systemd1_broker_manager_refresh_unit_snapshot(manager, "demo.service", &changed));
+        ASSERT_FALSE(changed);
+        ASSERT_EQ(systemd1_broker_unit_metadata_generation(unit), 3u);
+
+        context.snapshot_error = -EIO;
+        ASSERT_ERROR(systemd1_broker_manager_refresh_unit_snapshot(manager, "demo.service", &changed), EIO);
+        ASSERT_EQ(context.snapshot_calls, 4u);
+        ASSERT_EQ(context.snapshot_free_calls, 3u);
+        ASSERT_STREQ(systemd1_broker_unit_description(unit), "Demo Failed");
+        ASSERT_STREQ(systemd1_broker_unit_active_state(unit), "failed");
+        ASSERT_EQ(systemd1_broker_unit_metadata_generation(unit), 3u);
+        ASSERT_STREQ(systemd1_broker_property_value_json(ASSERT_PTR(systemd1_broker_unit_find_property(
+                                unit,
+                                "org.freedesktop.systemd1.Service",
+                                "MainPID"))), "4343");
+}
+
+TEST(manager_refresh_unit_snapshot_filters_unavailable_properties) {
+        static const Systemd1BrokerBackendProperty properties[] = {
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "Id",
+                        .signature = "s",
+                        .value_json = "\"wrong.service\"",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "com.example.Unsupported",
+                        .name = "VendorData",
+                        .signature = "s",
+                        .value_json = "\"ignored\"",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Service",
+                        .name = "SocketFD",
+                        .signature = "h",
+                        .value_json = "3",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Service",
+                        .name = "VariantFD",
+                        .signature = "v",
+                        .value_json = "{\"signature\":\"h\",\"value\":3}",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Service",
+                        .name = "MainPID",
+                        .signature = "u",
+                        .value_json = "1234",
+                },
+        };
+        static const Systemd1BrokerBackendUnitSnapshot snapshot = {
+                .size = sizeof(Systemd1BrokerBackendUnitSnapshot),
+                .state = SYSTEMD1_BROKER_BACKEND_RUNNING,
+                .description = "Demo",
+                .properties = properties,
+                .n_properties = ELEMENTSOF(properties),
+        };
+        _cleanup_(systemd1_broker_manager_freep) Systemd1BrokerManager *manager = NULL;
+        TestBackendContext context = { .snapshot = &snapshot };
+        const Systemd1BrokerBackendOps ops = TEST_BACKEND_OPS(&context);
+        Systemd1BrokerUnit *unit;
+
+        ASSERT_OK(systemd1_broker_manager_new(&manager));
+        ASSERT_OK(systemd1_broker_manager_set_backend(manager, &ops));
+        ASSERT_OK(systemd1_broker_manager_add_unit(manager, "demo.service", "Demo", &unit));
+        ASSERT_OK(systemd1_broker_manager_refresh_unit_snapshot(manager, "demo.service", NULL));
+
+        ASSERT_EQ(systemd1_broker_unit_n_properties(unit), 1u);
+        ASSERT_NULL(systemd1_broker_unit_find_property(unit, "org.freedesktop.systemd1.Unit", "Id"));
+        ASSERT_NULL(systemd1_broker_unit_find_property(unit, "com.example.Unsupported", "VendorData"));
+        ASSERT_NULL(systemd1_broker_unit_find_property(unit, "org.freedesktop.systemd1.Service", "SocketFD"));
+        ASSERT_NULL(systemd1_broker_unit_find_property(unit, "org.freedesktop.systemd1.Service", "VariantFD"));
+        ASSERT_NOT_NULL(systemd1_broker_unit_find_property(unit, "org.freedesktop.systemd1.Service", "MainPID"));
+}
+
+TEST(manager_refresh_unit_snapshot_accepts_composite_values) {
+        static const Systemd1BrokerBackendProperty properties[] = {
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "StringArray",
+                        .signature = "as",
+                        .value_json = "[\"alpha\",\"beta\"]",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "PairValue",
+                        .signature = "(us)",
+                        .value_json = "[7,\"seven\"]",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "DictionaryValue",
+                        .signature = "a{ss}",
+                        .value_json = "[[\"key\",\"value\"]]",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Service",
+                        .name = "VariantValue",
+                        .signature = "v",
+                        .value_json = "{\"signature\":\"u\",\"value\":42}",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Service",
+                        .name = "ObjectPathValue",
+                        .signature = "o",
+                        .value_json = "\"/org/freedesktop/systemd1/unit/demo_2eservice\"",
+                },
+        };
+        static const Systemd1BrokerBackendUnitSnapshot snapshot = {
+                .size = sizeof(Systemd1BrokerBackendUnitSnapshot),
+                .state = SYSTEMD1_BROKER_BACKEND_RUNNING,
+                .description = "Demo",
+                .properties = properties,
+                .n_properties = ELEMENTSOF(properties),
+        };
+        _cleanup_(systemd1_broker_manager_freep) Systemd1BrokerManager *manager = NULL;
+        TestBackendContext context = { .snapshot = &snapshot };
+        const Systemd1BrokerBackendOps ops = TEST_BACKEND_OPS(&context);
+        Systemd1BrokerUnit *unit;
+
+        ASSERT_OK(systemd1_broker_manager_new(&manager));
+        ASSERT_OK(systemd1_broker_manager_set_backend(manager, &ops));
+        ASSERT_OK(systemd1_broker_manager_add_unit(manager, "demo.service", "Demo", &unit));
+        ASSERT_OK(systemd1_broker_manager_refresh_unit_snapshot(manager, "demo.service", NULL));
+
+        ASSERT_EQ(systemd1_broker_unit_n_properties(unit), ELEMENTSOF(properties));
+        for (size_t i = 0; i < ELEMENTSOF(properties); i++) {
+                const Systemd1BrokerProperty *property;
+
+                property = ASSERT_PTR(systemd1_broker_unit_find_property(unit, properties[i].interface, properties[i].name));
+                ASSERT_STREQ(systemd1_broker_property_signature(property), properties[i].signature);
+                ASSERT_STREQ(systemd1_broker_property_value_json(property), properties[i].value_json);
+        }
+}
+
+TEST(property_append_value_preserves_typed_values) {
+        static const Systemd1BrokerBackendProperty properties[] = {
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "ScalarValue",
+                        .signature = "(ybnqiuxtd)",
+                        .value_json = "[255,true,-2,3,-4,5,-6,7,1.5]",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "StringArray",
+                        .signature = "as",
+                        .value_json = "[\"alpha\",\"beta\"]",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "PairValue",
+                        .signature = "(us)",
+                        .value_json = "[7,\"seven\"]",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "DictionaryValue",
+                        .signature = "a{ss}",
+                        .value_json = "[[\"key\",\"value\"]]",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Service",
+                        .name = "VariantValue",
+                        .signature = "v",
+                        .value_json = "{\"signature\":\"u\",\"value\":42}",
+                },
+        };
+        static const Systemd1BrokerBackendUnitSnapshot snapshot = {
+                .size = sizeof(Systemd1BrokerBackendUnitSnapshot),
+                .state = SYSTEMD1_BROKER_BACKEND_RUNNING,
+                .description = "Demo",
+                .properties = properties,
+                .n_properties = ELEMENTSOF(properties),
+        };
+        _cleanup_(systemd1_broker_manager_freep) Systemd1BrokerManager *manager = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *message = NULL;
+        _cleanup_strv_free_ char **strings = NULL;
+        TestBackendContext context = { .snapshot = &snapshot };
+        const Systemd1BrokerBackendOps ops = TEST_BACKEND_OPS(&context);
+        Systemd1BrokerUnit *unit;
+        const char *key, *pair_string;
+        uint8_t byte;
+        int boolean;
+        int16_t int16;
+        uint16_t uint16;
+        int32_t int32;
+        uint32_t uint32;
+        int64_t int64;
+        uint64_t uint64;
+        double real;
+
+        ASSERT_OK(systemd1_broker_manager_new(&manager));
+        ASSERT_OK(systemd1_broker_manager_set_backend(manager, &ops));
+        ASSERT_OK(systemd1_broker_manager_add_unit(manager, "demo.service", "Demo", &unit));
+        ASSERT_OK(systemd1_broker_manager_refresh_unit_snapshot(manager, "demo.service", NULL));
+
+        ASSERT_OK(new_property_value_message(ASSERT_PTR(systemd1_broker_unit_find_property(
+                                        unit, "org.freedesktop.systemd1.Unit", "ScalarValue")), &message));
+        ASSERT_OK(sd_bus_message_read(message, "(ybnqiuxtd)",
+                                      &byte, &boolean, &int16, &uint16, &int32, &uint32, &int64, &uint64, &real));
+        ASSERT_EQ(byte, 255);
+        ASSERT_TRUE(boolean);
+        ASSERT_EQ(int16, -2);
+        ASSERT_EQ(uint16, 3);
+        ASSERT_EQ(int32, -4);
+        ASSERT_EQ(uint32, 5u);
+        ASSERT_EQ(int64, -6);
+        ASSERT_EQ(uint64, 7u);
+        ASSERT_TRUE(real > 1.49 && real < 1.51);
+
+        message = sd_bus_message_unref(message);
+        ASSERT_OK(new_property_value_message(ASSERT_PTR(systemd1_broker_unit_find_property(
+                                        unit, "org.freedesktop.systemd1.Unit", "StringArray")), &message));
+        ASSERT_OK(sd_bus_message_read_strv(message, &strings));
+        ASSERT_TRUE(strv_equal(strings, STRV_MAKE("alpha", "beta")));
+
+        message = sd_bus_message_unref(message);
+        ASSERT_OK(new_property_value_message(ASSERT_PTR(systemd1_broker_unit_find_property(
+                                        unit, "org.freedesktop.systemd1.Unit", "PairValue")), &message));
+        ASSERT_OK(sd_bus_message_read(message, "(us)", &uint32, &pair_string));
+        ASSERT_EQ(uint32, 7u);
+        ASSERT_STREQ(pair_string, "seven");
+
+        message = sd_bus_message_unref(message);
+        ASSERT_OK(new_property_value_message(ASSERT_PTR(systemd1_broker_unit_find_property(
+                                        unit, "org.freedesktop.systemd1.Unit", "DictionaryValue")), &message));
+        ASSERT_OK(sd_bus_message_enter_container(message, 'a', "{ss}"));
+        ASSERT_OK(sd_bus_message_read(message, "{ss}", &key, &pair_string));
+        ASSERT_STREQ(key, "key");
+        ASSERT_STREQ(pair_string, "value");
+        ASSERT_OK_ZERO(sd_bus_message_read(message, "{ss}", &key, &pair_string));
+        ASSERT_OK(sd_bus_message_exit_container(message));
+
+        message = sd_bus_message_unref(message);
+        ASSERT_OK(new_property_value_message(ASSERT_PTR(systemd1_broker_unit_find_property(
+                                        unit, "org.freedesktop.systemd1.Service", "VariantValue")), &message));
+        ASSERT_OK(sd_bus_message_enter_container(message, 'v', "u"));
+        ASSERT_OK(sd_bus_message_read(message, "u", &uint32));
+        ASSERT_EQ(uint32, 42u);
+        ASSERT_OK(sd_bus_message_exit_container(message));
+}
+
+TEST(manager_refresh_unit_snapshot_rejects_duplicates_and_schema_conflicts) {
+        static const Systemd1BrokerBackendProperty uint_property = {
+                .size = sizeof(Systemd1BrokerBackendProperty),
+                .interface = "org.freedesktop.systemd1.Service",
+                .name = "DynamicValue",
+                .signature = "u",
+                .value_json = "1",
+        };
+        static const Systemd1BrokerBackendProperty string_property = {
+                .size = sizeof(Systemd1BrokerBackendProperty),
+                .interface = "org.freedesktop.systemd1.Service",
+                .name = "DynamicValue",
+                .signature = "s",
+                .value_json = "\"one\"",
+        };
+        static const Systemd1BrokerBackendProperty duplicate_properties[] = {
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "DynamicValue",
+                        .signature = "u",
+                        .value_json = "1",
+                },
+                {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Service",
+                        .name = "DynamicValue",
+                        .signature = "u",
+                        .value_json = "2",
+                },
+        };
+        Systemd1BrokerBackendUnitSnapshot snapshot = {
+                .size = sizeof(Systemd1BrokerBackendUnitSnapshot),
+                .state = SYSTEMD1_BROKER_BACKEND_RUNNING,
+                .description = "Demo",
+                .properties = &uint_property,
+                .n_properties = 1,
+        };
+        _cleanup_(systemd1_broker_manager_freep) Systemd1BrokerManager *manager = NULL;
+        TestBackendContext context = { .snapshot = &snapshot };
+        const Systemd1BrokerBackendOps ops = TEST_BACKEND_OPS(&context);
+        Systemd1BrokerUnit *alpha, *beta;
+
+        ASSERT_OK(systemd1_broker_manager_new(&manager));
+        ASSERT_OK(systemd1_broker_manager_set_backend(manager, &ops));
+        ASSERT_OK(systemd1_broker_manager_add_unit(manager, "alpha.service", "Alpha", &alpha));
+        ASSERT_OK(systemd1_broker_manager_add_unit(manager, "beta.service", "Beta", &beta));
+        ASSERT_OK(systemd1_broker_manager_refresh_unit_snapshot(manager, "alpha.service", NULL));
+
+        snapshot.properties = &string_property;
+        ASSERT_ERROR(systemd1_broker_manager_refresh_unit_snapshot(manager, "beta.service", NULL), EBADMSG);
+        ASSERT_EQ(systemd1_broker_unit_n_properties(beta), 0u);
+        ASSERT_EQ(systemd1_broker_unit_metadata_generation(beta), 0u);
+
+        snapshot.properties = duplicate_properties;
+        snapshot.n_properties = ELEMENTSOF(duplicate_properties);
+        ASSERT_ERROR(systemd1_broker_manager_refresh_unit_snapshot(manager, "alpha.service", NULL), EEXIST);
+        ASSERT_EQ(systemd1_broker_unit_n_properties(alpha), 1u);
+        ASSERT_EQ(systemd1_broker_unit_metadata_generation(alpha), 1u);
+}
+
+TEST(manager_refresh_unit_snapshot_rejects_invalid_values_and_limits) {
+        static const struct {
+                const char *interface;
+                const char *name;
+                const char *signature;
+                const char *value_json;
+        } invalid[] = {
+                { "not-an-interface", "Value", "u", "1" },
+                { "org.freedesktop.systemd1.Unit", "not-a-member", "u", "1" },
+                { "org.freedesktop.systemd1.Unit", "Value", "uu", "[1,2]" },
+                { "org.freedesktop.systemd1.Unit", "Value", "u", "{" },
+                { "org.freedesktop.systemd1.Unit", "Value", "s", "1" },
+                { "org.freedesktop.systemd1.Unit", "Value", "u", "null" },
+                { "org.freedesktop.systemd1.Unit", "Value", "u", "4294967296" },
+                { "org.freedesktop.systemd1.Unit", "Value", "(us)", "[1]" },
+                { "org.freedesktop.systemd1.Unit", "Value", "as", "[\"ok\",1]" },
+        };
+
+        for (size_t i = 0; i < ELEMENTSOF(invalid); i++) {
+                _cleanup_(systemd1_broker_manager_freep) Systemd1BrokerManager *manager = NULL;
+                const Systemd1BrokerBackendProperty property = {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = invalid[i].interface,
+                        .name = invalid[i].name,
+                        .signature = invalid[i].signature,
+                        .value_json = invalid[i].value_json,
+                };
+                const Systemd1BrokerBackendUnitSnapshot snapshot = {
+                        .size = sizeof(Systemd1BrokerBackendUnitSnapshot),
+                        .state = SYSTEMD1_BROKER_BACKEND_RUNNING,
+                        .description = "Demo",
+                        .properties = &property,
+                        .n_properties = 1,
+                };
+                TestBackendContext context = { .snapshot = &snapshot };
+                const Systemd1BrokerBackendOps ops = TEST_BACKEND_OPS(&context);
+                Systemd1BrokerUnit *unit;
+
+                ASSERT_OK(systemd1_broker_manager_new(&manager));
+                ASSERT_OK(systemd1_broker_manager_set_backend(manager, &ops));
+                ASSERT_OK(systemd1_broker_manager_add_unit(manager, "demo.service", "Demo", &unit));
+                ASSERT_LT(systemd1_broker_manager_refresh_unit_snapshot(manager, "demo.service", NULL), 0);
+                ASSERT_EQ(context.snapshot_free_calls, 1u);
+                ASSERT_EQ(systemd1_broker_unit_n_properties(unit), 0u);
+                ASSERT_EQ(systemd1_broker_unit_metadata_generation(unit), 0u);
+                ASSERT_STREQ(systemd1_broker_unit_description(unit), "Demo");
+        }
+
+        for (size_t n_properties = 257; n_properties > 0; n_properties = 0) {
+                _cleanup_(systemd1_broker_manager_freep) Systemd1BrokerManager *manager = NULL;
+                _cleanup_free_ Systemd1BrokerBackendProperty *properties = new0(Systemd1BrokerBackendProperty, n_properties);
+                Systemd1BrokerBackendUnitSnapshot snapshot = {
+                        .size = sizeof(Systemd1BrokerBackendUnitSnapshot),
+                        .state = SYSTEMD1_BROKER_BACKEND_RUNNING,
+                        .description = "Demo",
+                        .properties = properties,
+                        .n_properties = n_properties,
+                };
+                TestBackendContext context = { .snapshot = &snapshot };
+                const Systemd1BrokerBackendOps ops = TEST_BACKEND_OPS(&context);
+
+                ASSERT_NOT_NULL(properties);
+                for (size_t i = 0; i < n_properties; i++)
+                        properties[i] = (Systemd1BrokerBackendProperty) {
+                                .size = sizeof(Systemd1BrokerBackendProperty),
+                                .interface = "org.freedesktop.systemd1.Unit",
+                                .name = "Value",
+                                .signature = "u",
+                                .value_json = "1",
+                        };
+                ASSERT_OK(systemd1_broker_manager_new(&manager));
+                ASSERT_OK(systemd1_broker_manager_set_backend(manager, &ops));
+                ASSERT_OK(systemd1_broker_manager_add_unit(manager, "demo.service", "Demo", NULL));
+                ASSERT_ERROR(systemd1_broker_manager_refresh_unit_snapshot(manager, "demo.service", NULL), E2BIG);
+        }
+
+        {
+                _cleanup_(systemd1_broker_manager_freep) Systemd1BrokerManager *manager = NULL;
+                _cleanup_free_ char *value_json = new(char, 1024U * 1024U + 3U);
+                Systemd1BrokerBackendProperty property = {
+                        .size = sizeof(Systemd1BrokerBackendProperty),
+                        .interface = "org.freedesktop.systemd1.Unit",
+                        .name = "LargeValue",
+                        .signature = "s",
+                        .value_json = value_json,
+                };
+                Systemd1BrokerBackendUnitSnapshot snapshot = {
+                        .size = sizeof(Systemd1BrokerBackendUnitSnapshot),
+                        .state = SYSTEMD1_BROKER_BACKEND_RUNNING,
+                        .description = "Demo",
+                        .properties = &property,
+                        .n_properties = 1,
+                };
+                TestBackendContext context = { .snapshot = &snapshot };
+                const Systemd1BrokerBackendOps ops = TEST_BACKEND_OPS(&context);
+
+                ASSERT_NOT_NULL(value_json);
+                value_json[0] = '"';
+                memset(value_json + 1, 'x', 1024U * 1024U);
+                value_json[1024U * 1024U + 1U] = '"';
+                value_json[1024U * 1024U + 2U] = 0;
+                ASSERT_OK(systemd1_broker_manager_new(&manager));
+                ASSERT_OK(systemd1_broker_manager_set_backend(manager, &ops));
+                ASSERT_OK(systemd1_broker_manager_add_unit(manager, "demo.service", "Demo", NULL));
+                ASSERT_ERROR(systemd1_broker_manager_refresh_unit_snapshot(manager, "demo.service", NULL), E2BIG);
+        }
 }
 
 TEST(unit_info_matches_list_units_shape) {

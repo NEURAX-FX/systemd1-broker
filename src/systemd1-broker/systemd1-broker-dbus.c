@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdio.h>
+
 #include "sd-bus-vtable.h"
 
 #include "architecture.h"
@@ -7,9 +9,12 @@
 #include "build.h"
 #include "errno-util.h"
 #include "fd-util.h"
+#include "log.h"
+#include "memstream-util.h"
 #include "strv.h"
 #include "systemd1-broker-bus.h"
 #include "systemd1-broker-dbus.h"
+#include "systemd1-broker-metadata.h"
 
 static int reply_no_such_unit(sd_bus_error *ret_error, const char *name) {
         return sd_bus_error_setf(ret_error, "org.freedesktop.systemd1.NoSuchUnit", "Unit %s not found.", name);
@@ -436,6 +441,519 @@ static int find_unit(sd_bus *bus, const char *path, const char *interface, void 
                 }
         }
 
+        return 0;
+}
+
+static int open_property_entry(sd_bus_message *message, const char *name, const char *signature) {
+        int r;
+
+        r = sd_bus_message_open_container(message, 'e', "sv");
+        if (r < 0)
+                return r;
+        r = sd_bus_message_append_basic(message, 's', name);
+        if (r < 0)
+                return r;
+        return sd_bus_message_open_container(message, 'v', signature);
+}
+
+static int close_property_entry(sd_bus_message *message) {
+        int r;
+
+        r = sd_bus_message_close_container(message);
+        if (r < 0)
+                return r;
+        return sd_bus_message_close_container(message);
+}
+
+static const char* core_property_signature(const char *name) {
+        if (STR_IN_SET(name, "Id", "Description", "LoadState", "ActiveState", "SubState"))
+                return "s";
+        if (streq(name, "Names"))
+                return "as";
+        if (streq(name, "Job"))
+                return "(uo)";
+        return NULL;
+}
+
+static int append_core_property_value(sd_bus_message *message, Systemd1BrokerUnit *unit, const char *name) {
+        Systemd1BrokerUnitProperties properties;
+        int r;
+
+        r = systemd1_broker_unit_get_properties(unit, &properties);
+        if (r < 0)
+                return r;
+
+        if (streq(name, "Id"))
+                return sd_bus_message_append(message, "s", properties.id);
+        if (streq(name, "Names"))
+                return sd_bus_message_append_strv(message, STRV_MAKE(properties.id));
+        if (streq(name, "Description"))
+                return sd_bus_message_append(message, "s", properties.description);
+        if (streq(name, "LoadState"))
+                return sd_bus_message_append(message, "s", properties.load_state);
+        if (streq(name, "ActiveState"))
+                return sd_bus_message_append(message, "s", properties.active_state);
+        if (streq(name, "SubState"))
+                return sd_bus_message_append(message, "s", properties.sub_state);
+        if (streq(name, "Job"))
+                return sd_bus_message_append(message, "(uo)", properties.job_id, properties.job_path);
+        return -ENOENT;
+}
+
+static int append_core_property(sd_bus_message *message, Systemd1BrokerUnit *unit, const char *name) {
+        const char *signature;
+        int r;
+
+        signature = core_property_signature(name);
+        if (!signature)
+                return -ENOENT;
+        r = open_property_entry(message, name, signature);
+        if (r < 0)
+                return r;
+        r = append_core_property_value(message, unit, name);
+        if (r < 0)
+                return r;
+        return close_property_entry(message);
+}
+
+static int append_dynamic_property(sd_bus_message *message, const Systemd1BrokerProperty *property) {
+        int r;
+
+        r = open_property_entry(
+                        message,
+                        systemd1_broker_property_name(property),
+                        systemd1_broker_property_signature(property));
+        if (r < 0)
+                return r;
+        r = systemd1_broker_property_append_value(message, property);
+        if (r < 0)
+                return r;
+        return close_property_entry(message);
+}
+
+typedef struct PropertyCopy {
+        char *interface;
+        char *name;
+        char *signature;
+        char *value_json;
+} PropertyCopy;
+
+static void property_copies_free(PropertyCopy *copies, size_t n_copies) {
+        if (!copies)
+                return;
+
+        for (size_t i = 0; i < n_copies; i++) {
+                free(copies[i].interface);
+                free(copies[i].name);
+                free(copies[i].signature);
+                free(copies[i].value_json);
+        }
+        free(copies);
+}
+
+static int property_copies_new(Systemd1BrokerUnit *unit, PropertyCopy **ret, size_t *ret_n) {
+        PropertyCopy *copies;
+        size_t n;
+
+        n = systemd1_broker_unit_n_properties(unit);
+        if (n == 0) {
+                *ret = NULL;
+                *ret_n = 0;
+                return 0;
+        }
+
+        copies = new0(PropertyCopy, n);
+        if (!copies)
+                return -ENOMEM;
+        for (size_t i = 0; i < n; i++) {
+                const Systemd1BrokerProperty *property = ASSERT_PTR(systemd1_broker_unit_property_at(unit, i));
+
+                copies[i] = (PropertyCopy) {
+                        .interface = strdup(systemd1_broker_property_interface(property)),
+                        .name = strdup(systemd1_broker_property_name(property)),
+                        .signature = strdup(systemd1_broker_property_signature(property)),
+                        .value_json = strdup(systemd1_broker_property_value_json(property)),
+                };
+                if (!copies[i].interface || !copies[i].name || !copies[i].signature || !copies[i].value_json) {
+                        property_copies_free(copies, n);
+                        return -ENOMEM;
+                }
+        }
+
+        *ret = copies;
+        *ret_n = n;
+        return 0;
+}
+
+static const PropertyCopy* property_copy_find(
+                const PropertyCopy *copies,
+                size_t n_copies,
+                const char *interface,
+                const char *name) {
+
+        for (size_t i = 0; i < n_copies; i++)
+                if (streq(copies[i].interface, interface) && streq(copies[i].name, name))
+                        return copies + i;
+        return NULL;
+}
+
+static int emit_properties_invalidated(sd_bus *bus, Systemd1BrokerUnit *unit, const char *interface, char **names) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *message = NULL;
+        int r;
+
+        if (strv_isempty(names))
+                return 0;
+        strv_sort_uniq(names);
+
+        r = sd_bus_message_new_signal(
+                        bus,
+                        &message,
+                        systemd1_broker_unit_path(unit),
+                        "org.freedesktop.DBus.Properties",
+                        "PropertiesChanged");
+        if (r < 0)
+                return r;
+        r = sd_bus_message_append(message, "s", interface);
+        if (r < 0)
+                return r;
+        r = sd_bus_message_open_container(message, 'a', "{sv}");
+        if (r < 0)
+                return r;
+        r = sd_bus_message_close_container(message);
+        if (r < 0)
+                return r;
+        r = sd_bus_message_append_strv(message, names);
+        if (r < 0)
+                return r;
+        return sd_bus_send(bus, message, NULL);
+}
+
+static int invalidated_property_extend(char ***unit_names, char ***service_names, const char *interface, const char *name) {
+        if (streq(interface, "org.freedesktop.systemd1.Unit"))
+                return strv_extend(unit_names, name);
+        if (streq(interface, "org.freedesktop.systemd1.Service"))
+                return strv_extend(service_names, name);
+        return -EINVAL;
+}
+
+static void refresh_unit_metadata(sd_bus *bus, Systemd1BrokerUnit *unit) {
+        _cleanup_strv_free_ char **service_names = NULL, **unit_names = NULL;
+        _cleanup_free_ char *old_description = NULL;
+        PropertyCopy *old_properties = NULL;
+        const char *old_active_state, *old_sub_state;
+        size_t n_old_properties = 0;
+        bool changed = false;
+        int r;
+
+        old_description = strdup(systemd1_broker_unit_description(unit));
+        if (!old_description)
+                return;
+        old_active_state = systemd1_broker_unit_active_state(unit);
+        old_sub_state = systemd1_broker_unit_sub_state(unit);
+        r = property_copies_new(unit, &old_properties, &n_old_properties);
+        if (r < 0)
+                return;
+
+        r = systemd1_broker_manager_refresh_unit_snapshot(
+                        systemd1_broker_unit_manager(unit),
+                        systemd1_broker_unit_name(unit),
+                        &changed);
+        if (r < 0) {
+                if (r != -EOPNOTSUPP)
+                        log_debug_errno(r, "Failed to refresh metadata for %s, using cached generation: %m", systemd1_broker_unit_name(unit));
+                goto finish;
+        }
+        if (!changed || !bus)
+                goto finish;
+
+        for (size_t i = 0; i < n_old_properties; i++) {
+                const Systemd1BrokerProperty *property;
+
+                property = systemd1_broker_unit_find_property(unit, old_properties[i].interface, old_properties[i].name);
+                if (property &&
+                    streq(old_properties[i].signature, systemd1_broker_property_signature(property)) &&
+                    streq(old_properties[i].value_json, systemd1_broker_property_value_json(property)))
+                        continue;
+                r = invalidated_property_extend(
+                                &unit_names,
+                                &service_names,
+                                old_properties[i].interface,
+                                old_properties[i].name);
+                if (r < 0)
+                        goto signal_error;
+        }
+        for (size_t i = 0; i < systemd1_broker_unit_n_properties(unit); i++) {
+                const Systemd1BrokerProperty *property = ASSERT_PTR(systemd1_broker_unit_property_at(unit, i));
+
+                if (property_copy_find(
+                                old_properties,
+                                n_old_properties,
+                                systemd1_broker_property_interface(property),
+                                systemd1_broker_property_name(property)))
+                        continue;
+                r = invalidated_property_extend(
+                                &unit_names,
+                                &service_names,
+                                systemd1_broker_property_interface(property),
+                                systemd1_broker_property_name(property));
+                if (r < 0)
+                        goto signal_error;
+        }
+        if (!streq(old_description, systemd1_broker_unit_description(unit))) {
+                r = strv_extend(&unit_names, "Description");
+                if (r < 0)
+                        goto signal_error;
+        }
+        if (!streq(old_active_state, systemd1_broker_unit_active_state(unit))) {
+                r = strv_extend(&unit_names, "ActiveState");
+                if (r < 0)
+                        goto signal_error;
+        }
+        if (!streq(old_sub_state, systemd1_broker_unit_sub_state(unit))) {
+                r = strv_extend(&unit_names, "SubState");
+                if (r < 0)
+                        goto signal_error;
+        }
+
+        r = emit_properties_invalidated(bus, unit, "org.freedesktop.systemd1.Unit", unit_names);
+        if (r < 0)
+                goto signal_error;
+        r = emit_properties_invalidated(bus, unit, "org.freedesktop.systemd1.Service", service_names);
+        if (r < 0)
+                goto signal_error;
+        goto finish;
+
+signal_error:
+        log_debug_errno(r, "Failed to emit metadata invalidation for %s: %m", systemd1_broker_unit_name(unit));
+
+finish:
+        property_copies_free(old_properties, n_old_properties);
+}
+
+static bool unit_supports_interface(Systemd1BrokerUnit *unit, const char *interface) {
+        if (streq(interface, "org.freedesktop.systemd1.Unit"))
+                return true;
+        if (streq(interface, "org.freedesktop.systemd1.Service"))
+                return endswith(systemd1_broker_unit_name(unit), ".service");
+        return false;
+}
+
+static int method_unit_properties_get_all(sd_bus_message *message, Systemd1BrokerUnit *unit, sd_bus_error *ret_error) {
+        static const char * const core_properties[] = {
+                "Id",
+                "Names",
+                "Description",
+                "LoadState",
+                "ActiveState",
+                "SubState",
+                "Job",
+        };
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        const char *interface;
+        bool all;
+        int r;
+
+        r = sd_bus_message_read(message, "s", &interface);
+        if (r < 0)
+                return r;
+        all = isempty(interface);
+        if (!all && !unit_supports_interface(unit, interface))
+                return sd_bus_error_setf(ret_error, SD_BUS_ERROR_UNKNOWN_INTERFACE, "Unknown unit interface %s.", interface);
+
+        refresh_unit_metadata(sd_bus_message_get_bus(message), unit);
+        r = sd_bus_message_new_method_return(message, &reply);
+        if (r < 0)
+                return r;
+        r = sd_bus_message_open_container(reply, 'a', "{sv}");
+        if (r < 0)
+                return r;
+
+        if (all || streq(interface, "org.freedesktop.systemd1.Unit"))
+                FOREACH_ELEMENT(name, core_properties) {
+                        r = append_core_property(reply, unit, *name);
+                        if (r < 0)
+                                return r;
+                }
+
+        for (size_t i = 0; i < systemd1_broker_unit_n_properties(unit); i++) {
+                const Systemd1BrokerProperty *property = ASSERT_PTR(systemd1_broker_unit_property_at(unit, i));
+
+                if (!all && !streq(interface, systemd1_broker_property_interface(property)))
+                        continue;
+                r = append_dynamic_property(reply, property);
+                if (r < 0)
+                        return r;
+        }
+
+        r = sd_bus_message_close_container(reply);
+        if (r < 0)
+                return r;
+        return sd_bus_send(NULL, reply, NULL);
+}
+
+static int reply_unit_property(
+                sd_bus_message *message,
+                Systemd1BrokerUnit *unit,
+                const char *interface,
+                const char *name,
+                sd_bus_error *ret_error) {
+
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        const Systemd1BrokerProperty *property;
+        const char *signature;
+        int r;
+
+        if (!unit_supports_interface(unit, interface))
+                return sd_bus_error_setf(ret_error, SD_BUS_ERROR_UNKNOWN_INTERFACE, "Unknown unit interface %s.", interface);
+
+        refresh_unit_metadata(sd_bus_message_get_bus(message), unit);
+        property = systemd1_broker_unit_find_property(unit, interface, name);
+        signature = streq(interface, "org.freedesktop.systemd1.Unit") ? core_property_signature(name) : NULL;
+        if (!property && !signature && streq(interface, "org.freedesktop.systemd1.Unit") && streq(name, "FragmentPath"))
+                signature = "s";
+        if (!property && !signature && streq(interface, "org.freedesktop.systemd1.Unit") && streq(name, "DropInPaths"))
+                signature = "as";
+        if (!property && !signature)
+                return sd_bus_error_setf(ret_error, SD_BUS_ERROR_UNKNOWN_PROPERTY, "Unknown property %s.%s.", interface, name);
+
+        r = sd_bus_message_new_method_return(message, &reply);
+        if (r < 0)
+                return r;
+        r = sd_bus_message_open_container(reply, 'v', property ? systemd1_broker_property_signature(property) : signature);
+        if (r < 0)
+                return r;
+        if (property)
+                r = systemd1_broker_property_append_value(reply, property);
+        else if (core_property_signature(name))
+                r = append_core_property_value(reply, unit, name);
+        else if (streq(name, "FragmentPath"))
+                r = sd_bus_message_append(reply, "s", "");
+        else
+                r = sd_bus_message_append_strv(reply, NULL);
+        if (r < 0)
+                return r;
+        r = sd_bus_message_close_container(reply);
+        if (r < 0)
+                return r;
+        return sd_bus_send(NULL, reply, NULL);
+}
+
+static int method_unit_properties_get(sd_bus_message *message, Systemd1BrokerUnit *unit, sd_bus_error *ret_error) {
+        const char *interface, *name;
+        int r;
+
+        r = sd_bus_message_read(message, "ss", &interface, &name);
+        if (r < 0)
+                return r;
+        return reply_unit_property(message, unit, interface, name, ret_error);
+}
+
+static int append_introspection_property(FILE *stream, const char *name, const char *signature) {
+        return fprintf(stream, "    <property name=\"%s\" type=\"%s\" access=\"read\"/>\n", name, signature) < 0 ? -EIO : 0;
+}
+
+static int method_unit_introspect(sd_bus_message *message, Systemd1BrokerUnit *unit) {
+        static const char * const core_properties[] = {
+                "Id",
+                "Names",
+                "Description",
+                "LoadState",
+                "ActiveState",
+                "SubState",
+                "Job",
+        };
+        _cleanup_(memstream_done) MemStream memstream = {};
+        _cleanup_free_ char *xml = NULL;
+        FILE *stream;
+        int r;
+
+        refresh_unit_metadata(sd_bus_message_get_bus(message), unit);
+        stream = memstream_init(&memstream);
+        if (!stream)
+                return -ENOMEM;
+        if (fputs("<node>\n  <interface name=\"org.freedesktop.systemd1.Unit\">\n", stream) < 0)
+                return -EIO;
+        FOREACH_ELEMENT(name, core_properties) {
+                r = append_introspection_property(stream, *name, ASSERT_PTR(core_property_signature(*name)));
+                if (r < 0)
+                        return r;
+        }
+        for (size_t i = 0; i < systemd1_broker_unit_n_properties(unit); i++) {
+                const Systemd1BrokerProperty *property = ASSERT_PTR(systemd1_broker_unit_property_at(unit, i));
+
+                if (!streq(systemd1_broker_property_interface(property), "org.freedesktop.systemd1.Unit"))
+                        continue;
+                r = append_introspection_property(
+                                stream,
+                                systemd1_broker_property_name(property),
+                                systemd1_broker_property_signature(property));
+                if (r < 0)
+                        return r;
+        }
+        if (fputs("    <method name=\"Start\"><arg name=\"mode\" type=\"s\" direction=\"in\"/><arg name=\"job\" type=\"o\" direction=\"out\"/></method>\n"
+                  "    <method name=\"Stop\"><arg name=\"mode\" type=\"s\" direction=\"in\"/><arg name=\"job\" type=\"o\" direction=\"out\"/></method>\n"
+                  "    <method name=\"Restart\"><arg name=\"mode\" type=\"s\" direction=\"in\"/><arg name=\"job\" type=\"o\" direction=\"out\"/></method>\n"
+                  "  </interface>\n",
+                  stream) < 0)
+                return -EIO;
+
+        if (endswith(systemd1_broker_unit_name(unit), ".service")) {
+                if (fputs("  <interface name=\"org.freedesktop.systemd1.Service\">\n", stream) < 0)
+                        return -EIO;
+                for (size_t i = 0; i < systemd1_broker_unit_n_properties(unit); i++) {
+                        const Systemd1BrokerProperty *property = ASSERT_PTR(systemd1_broker_unit_property_at(unit, i));
+
+                        if (!streq(systemd1_broker_property_interface(property), "org.freedesktop.systemd1.Service"))
+                                continue;
+                        r = append_introspection_property(
+                                        stream,
+                                        systemd1_broker_property_name(property),
+                                        systemd1_broker_property_signature(property));
+                        if (r < 0)
+                                return r;
+                }
+                if (fputs("  </interface>\n", stream) < 0)
+                        return -EIO;
+        }
+        if (fputs("  <interface name=\"org.freedesktop.DBus.Properties\">\n"
+                  "    <method name=\"Get\"><arg type=\"s\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"v\" direction=\"out\"/></method>\n"
+                  "    <method name=\"GetAll\"><arg type=\"s\" direction=\"in\"/><arg type=\"a{sv}\" direction=\"out\"/></method>\n"
+                  "    <method name=\"Set\"><arg type=\"s\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"v\" direction=\"in\"/></method>\n"
+                  "    <signal name=\"PropertiesChanged\"><arg type=\"s\"/><arg type=\"a{sv}\"/><arg type=\"as\"/></signal>\n"
+                  "  </interface>\n"
+                  "  <interface name=\"org.freedesktop.DBus.Introspectable\"><method name=\"Introspect\"><arg type=\"s\" direction=\"out\"/></method></interface>\n"
+                  "</node>\n",
+                  stream) < 0)
+                return -EIO;
+        r = memstream_finalize(&memstream, &xml, NULL);
+        if (r < 0)
+                return r;
+        return sd_bus_reply_method_return(message, "s", xml);
+}
+
+static int unit_object_handler(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
+        Systemd1BrokerManager *manager = ASSERT_PTR(userdata);
+        Systemd1BrokerUnit *unit = NULL;
+        int r;
+
+        r = find_unit(
+                        sd_bus_message_get_bus(message),
+                        sd_bus_message_get_path(message),
+                        sd_bus_message_get_interface(message),
+                        manager,
+                        (void**) &unit,
+                        ret_error);
+        if (r <= 0)
+                return r;
+
+        if (sd_bus_message_is_method_call(message, "org.freedesktop.DBus.Properties", "GetAll"))
+                return method_unit_properties_get_all(message, unit, ret_error);
+        if (sd_bus_message_is_method_call(message, "org.freedesktop.DBus.Properties", "Get"))
+                return method_unit_properties_get(message, unit, ret_error);
+        if (sd_bus_message_is_method_call(message, "org.freedesktop.DBus.Properties", "Set"))
+                return sd_bus_error_set(ret_error, SD_BUS_ERROR_PROPERTY_READ_ONLY, "Unit properties are read-only.");
+        if (sd_bus_message_is_method_call(message, "org.freedesktop.DBus.Introspectable", "Introspect"))
+                return method_unit_introspect(message, unit);
         return 0;
 }
 
@@ -1116,6 +1634,15 @@ int systemd1_broker_dbus_add_manager(sd_bus *bus, Systemd1BrokerManager *manager
                         "/org/freedesktop/systemd1",
                         "org.freedesktop.systemd1.Manager",
                         manager_vtable,
+                        manager);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_add_fallback(
+                        bus,
+                        NULL,
+                        "/org/freedesktop/systemd1/unit",
+                        unit_object_handler,
                         manager);
         if (r < 0)
                 return r;

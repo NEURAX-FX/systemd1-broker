@@ -7,6 +7,7 @@
 typedef struct Systemd1BrokerUnit Systemd1BrokerUnit;
 typedef struct Systemd1BrokerManager Systemd1BrokerManager;
 typedef struct Systemd1BrokerJob Systemd1BrokerJob;
+typedef struct Systemd1BrokerProperty Systemd1BrokerProperty;
 
 typedef struct Systemd1BrokerUnitInfo {
         const char *id;
@@ -74,6 +75,7 @@ int systemd1_broker_manager_set_backend(Systemd1BrokerManager *manager, const Sy
 int systemd1_broker_manager_load_backend(Systemd1BrokerManager *manager, const char *path);
 int systemd1_broker_manager_sync_units(Systemd1BrokerManager *manager);
 bool systemd1_broker_manager_has_synced_units(Systemd1BrokerManager *manager);
+int systemd1_broker_manager_refresh_unit_snapshot(Systemd1BrokerManager *manager, const char *name, bool *ret_changed);
 int systemd1_broker_manager_add_unit(Systemd1BrokerManager *manager, const char *name, const char *description, Systemd1BrokerUnit **ret);
 Systemd1BrokerUnit* systemd1_broker_manager_get_unit(Systemd1BrokerManager *manager, const char *name);
 int systemd1_broker_manager_refresh_unit_status(Systemd1BrokerManager *manager, const char *name);
@@ -111,6 +113,14 @@ const char* systemd1_broker_unit_path(Systemd1BrokerUnit *unit);
 const char* systemd1_broker_unit_active_state(Systemd1BrokerUnit *unit);
 const char* systemd1_broker_unit_sub_state(Systemd1BrokerUnit *unit);
 Systemd1BrokerManager* systemd1_broker_unit_manager(Systemd1BrokerUnit *unit);
+size_t systemd1_broker_unit_n_properties(Systemd1BrokerUnit *unit);
+uint64_t systemd1_broker_unit_metadata_generation(Systemd1BrokerUnit *unit);
+const Systemd1BrokerProperty* systemd1_broker_unit_property_at(Systemd1BrokerUnit *unit, size_t index);
+const Systemd1BrokerProperty* systemd1_broker_unit_find_property(Systemd1BrokerUnit *unit, const char *interface, const char *name);
+const char* systemd1_broker_property_interface(const Systemd1BrokerProperty *property);
+const char* systemd1_broker_property_name(const Systemd1BrokerProperty *property);
+const char* systemd1_broker_property_signature(const Systemd1BrokerProperty *property);
+const char* systemd1_broker_property_value_json(const Systemd1BrokerProperty *property);
 int systemd1_broker_job_get_info(Systemd1BrokerJob *job, Systemd1BrokerJobInfo *ret);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Systemd1BrokerManager*, systemd1_broker_manager_free);

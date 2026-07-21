@@ -3,6 +3,7 @@
 systemd1_broker_sources = files(
         'systemd1-broker-bus.c',
         'systemd1-broker-dbus.c',
+        'systemd1-broker-metadata.c',
         'systemd1-broker.c',
 )
 

@@ -9,8 +9,10 @@
 #include "string-util.h"
 #include "strv.h"
 #include "systemd1-broker.h"
+#include "systemd1-broker-metadata.h"
 #include "unit-def.h"
 #include "unit-name.h"
+#include "utf8.h"
 
 struct Systemd1BrokerUnit {
         Systemd1BrokerManager *manager;
@@ -20,6 +22,9 @@ struct Systemd1BrokerUnit {
         Systemd1BrokerBackendState backend_state;
         Systemd1BrokerJob *job;
         uint64_t catalog_generation;
+        Systemd1BrokerProperty *properties;
+        size_t n_properties;
+        uint64_t metadata_generation;
 };
 
 struct Systemd1BrokerManager {
@@ -29,6 +34,7 @@ struct Systemd1BrokerManager {
         size_t n_jobs;
         uint32_t next_job_id;
         uint64_t catalog_generation;
+        Systemd1BrokerMetadataSchema *metadata_schema;
         void *backend_dl;
         Systemd1BrokerBackendOps backend_ops;
 };
@@ -111,6 +117,7 @@ Systemd1BrokerManager* systemd1_broker_manager_free(Systemd1BrokerManager *manag
                 systemd1_broker_job_free(manager->jobs[i]);
 
         safe_dlclose(manager->backend_dl);
+        systemd1_broker_metadata_schema_free(manager->metadata_schema);
         free(manager->units);
         free(manager->jobs);
 
@@ -281,6 +288,87 @@ int systemd1_broker_manager_set_backend(Systemd1BrokerManager *manager, const Sy
 
         manager->backend_ops = *ops;
         return 0;
+}
+
+int systemd1_broker_manager_refresh_unit_snapshot(Systemd1BrokerManager *manager, const char *name, bool *ret_changed) {
+        _cleanup_free_ char *description = NULL;
+        Systemd1BrokerBackendUnitExtra extra = {
+                .size = sizeof(Systemd1BrokerBackendUnitExtra),
+                .id = name,
+        };
+        Systemd1BrokerBackendUnitSnapshot *snapshot = NULL;
+        Systemd1BrokerMetadataSchema *schema = NULL, *old_schema;
+        Systemd1BrokerProperty *properties = NULL, *old_properties;
+        size_t n_properties = 0, old_n_properties;
+        Systemd1BrokerUnit *unit;
+        bool changed;
+        int r;
+
+        assert(manager);
+        assert(name);
+
+        unit = systemd1_broker_manager_get_unit(manager, name);
+        if (!unit)
+                return -ENOENT;
+        if (!manager->backend_ops.get_unit_snapshot || !manager->backend_ops.free_unit_snapshot)
+                return -EOPNOTSUPP;
+
+        r = manager->backend_ops.get_unit_snapshot(manager->backend_ops.userdata, name, &extra, &snapshot);
+        if (r < 0)
+                return r;
+        if (!snapshot || snapshot->size < sizeof(Systemd1BrokerBackendUnitSnapshot) ||
+            !systemd1_broker_backend_state_to_active_state(snapshot->state) ||
+            (snapshot->description && !utf8_is_valid(snapshot->description))) {
+                r = -EBADMSG;
+                goto finish;
+        }
+        if (unit->metadata_generation == UINT64_MAX) {
+                r = -EOVERFLOW;
+                goto finish;
+        }
+
+        if (!isempty(snapshot->description)) {
+                description = strdup(snapshot->description);
+                if (!description) {
+                        r = -ENOMEM;
+                        goto finish;
+                }
+        }
+        r = systemd1_broker_metadata_prepare(
+                        manager->metadata_schema,
+                        snapshot,
+                        &properties,
+                        &n_properties,
+                        &schema);
+        if (r < 0)
+                goto finish;
+
+        changed = unit->backend_state != snapshot->state ||
+                  (description && !streq(unit->description, description)) ||
+                  !systemd1_broker_properties_equal(unit->properties, unit->n_properties, properties, n_properties);
+
+        old_schema = manager->metadata_schema;
+        manager->metadata_schema = TAKE_PTR(schema);
+        old_properties = unit->properties;
+        old_n_properties = unit->n_properties;
+        unit->properties = TAKE_PTR(properties);
+        unit->n_properties = n_properties;
+        unit->backend_state = snapshot->state;
+        if (description)
+                free_and_replace(unit->description, description);
+        unit->metadata_generation++;
+
+        systemd1_broker_metadata_schema_free(old_schema);
+        systemd1_broker_properties_free(old_properties, old_n_properties);
+        if (ret_changed)
+                *ret_changed = changed;
+        r = 0;
+
+finish:
+        systemd1_broker_metadata_schema_free(schema);
+        systemd1_broker_properties_free(properties, n_properties);
+        manager->backend_ops.free_unit_snapshot(manager->backend_ops.userdata, snapshot);
+        return r;
 }
 
 int systemd1_broker_manager_load_backend(Systemd1BrokerManager *manager, const char *path) {
@@ -859,6 +947,7 @@ Systemd1BrokerUnit* systemd1_broker_unit_free(Systemd1BrokerUnit *unit) {
         free(unit->name);
         free(unit->description);
         free(unit->path);
+        systemd1_broker_properties_free(unit->properties, unit->n_properties);
 
         return mfree(unit);
 }
@@ -1009,4 +1098,34 @@ Systemd1BrokerManager* systemd1_broker_unit_manager(Systemd1BrokerUnit *unit) {
         assert(unit);
 
         return unit->manager;
+}
+
+size_t systemd1_broker_unit_n_properties(Systemd1BrokerUnit *unit) {
+        assert(unit);
+
+        return unit->n_properties;
+}
+
+uint64_t systemd1_broker_unit_metadata_generation(Systemd1BrokerUnit *unit) {
+        assert(unit);
+
+        return unit->metadata_generation;
+}
+
+const Systemd1BrokerProperty* systemd1_broker_unit_property_at(Systemd1BrokerUnit *unit, size_t index) {
+        assert(unit);
+
+        return systemd1_broker_properties_at(unit->properties, unit->n_properties, index);
+}
+
+const Systemd1BrokerProperty* systemd1_broker_unit_find_property(
+                Systemd1BrokerUnit *unit,
+                const char *interface,
+                const char *name) {
+
+        assert(unit);
+        assert(interface);
+        assert(name);
+
+        return systemd1_broker_properties_find(unit->properties, unit->n_properties, interface, name);
 }
