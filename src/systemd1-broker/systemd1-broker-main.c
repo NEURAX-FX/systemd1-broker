@@ -172,6 +172,10 @@ static int connect_bus_address(const char *address, Systemd1BrokerManager *manag
         if (r < 0)
                 return r;
 
+        r = systemd1_broker_dbus_subscribe_activation(bus, manager);
+        if (r < 0)
+                return r;
+
         r = sd_bus_request_name(bus, "org.freedesktop.systemd1", SD_BUS_NAME_REPLACE_EXISTING|SD_BUS_NAME_ALLOW_REPLACEMENT);
         if (r < 0)
                 return r;

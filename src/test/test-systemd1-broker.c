@@ -8,6 +8,8 @@
 #include "alloc-util.h"
 #include "bus-internal.h"
 #include "fd-util.h"
+#include "fileio.h"
+#include "mkdir.h"
 #include "path-util.h"
 #include "pidref.h"
 #include "process-util.h"
@@ -1428,6 +1430,178 @@ TEST_RET(executable_bus_address_smoke) {
         ASSERT_OK(pidref_wait_for_terminate(&bus_daemon, &si));
         ASSERT_EQ(si.si_code, CLD_EXITED);
         ASSERT_EQ(si.si_status, EXIT_SUCCESS);
+        pidref_done(&bus_daemon);
+
+        return EXIT_SUCCESS;
+}
+
+TEST_RET(executable_dbus_activation_request) {
+        _cleanup_(pidref_done_sigkill_wait) PidRef bus_daemon = PIDREF_NULL, broker = PIDREF_NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *tmpdir = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL, *trigger = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        const char *build_root, *broker_path, *socket_path, *bus_socket_path, *bus_address;
+        const char *service_dir, *service_file, *config_file, *unit_path;
+        bool found_job = false;
+        siginfo_t si;
+        int r;
+
+        build_root = getenv("PROJECT_BUILD_ROOT");
+        if (!build_root)
+                return log_tests_skipped("PROJECT_BUILD_ROOT is not set");
+
+        broker_path = strjoina(build_root, "/systemd1-broker");
+        if (access(broker_path, X_OK) < 0)
+                return log_tests_skipped_errno(errno, "%s is not executable", broker_path);
+
+        if (access("/usr/bin/dbus-daemon", X_OK) < 0)
+                return log_tests_skipped_errno(errno, "/usr/bin/dbus-daemon is not executable");
+
+        ASSERT_OK(mkdtemp_malloc(NULL, &tmpdir));
+        socket_path = strjoina(tmpdir, "/broker.sock");
+        bus_socket_path = strjoina(tmpdir, "/bus.sock");
+        bus_address = strjoina("unix:path=", bus_socket_path);
+        service_dir = strjoina(tmpdir, "/services");
+        service_file = strjoina(service_dir, "/org.probe.Activation.service");
+        config_file = strjoina(tmpdir, "/bus.conf");
+
+        ASSERT_OK(mkdir_p(service_dir, 0755));
+        ASSERT_OK(write_string_file(
+                        service_file,
+                        "[D-BUS Service]\n"
+                        "Name=org.probe.Activation\n"
+                        "Exec=/bin/false\n"
+                        "SystemdService=probe-activation.service\n",
+                        WRITE_STRING_FILE_CREATE));
+        ASSERT_OK(write_string_file(
+                        strjoina(service_dir, "/org.probe.Broken.service"),
+                        "[D-BUS Service]\n"
+                        "Name=org.probe.Broken\n"
+                        "Exec=/bin/false\n"
+                        "SystemdService=not a unit\n",
+                        WRITE_STRING_FILE_CREATE));
+        ASSERT_OK(write_string_filef(
+                        config_file,
+                        WRITE_STRING_FILE_CREATE,
+                        "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n"
+                        "<busconfig>\n"
+                        "  <type>session</type>\n"
+                        "  <listen>unix:path=%s</listen>\n"
+                        "  <servicedir>%s</servicedir>\n"
+                        "  <policy context=\"default\">\n"
+                        "    <allow send_destination=\"*\"/>\n"
+                        "    <allow receive_sender=\"*\"/>\n"
+                        "    <allow own=\"*\"/>\n"
+                        "  </policy>\n"
+                        "</busconfig>\n",
+                        bus_socket_path,
+                        service_dir));
+
+        r = ASSERT_OK(pidref_safe_fork("(dbus-daemon)", FORK_DEATHSIG_SIGKILL|FORK_LOG, &bus_daemon));
+        if (r == 0) {
+                const char *config_arg = strjoina("--config-file=", config_file);
+
+                execl("/usr/bin/dbus-daemon", "dbus-daemon", config_arg, "--systemd-activation", "--nofork", "--nopidfile", NULL);
+                _exit(EXIT_FAILURE);
+        }
+
+        for (unsigned i = 0; i < 200; i++) {
+                r = is_socket(bus_socket_path);
+                if (r > 0)
+                        break;
+                if (r < 0 && r != -ENOENT)
+                        return r;
+
+                usleep_safe(10 * USEC_PER_MSEC);
+        }
+        ASSERT_OK_POSITIVE(is_socket(bus_socket_path));
+
+        r = ASSERT_OK(pidref_safe_fork("(systemd1-broker)", FORK_DEATHSIG_SIGKILL|FORK_LOG, &broker));
+        if (r == 0) {
+                const char *socket_arg = strjoina("--socket=", socket_path);
+                const char *bus_address_arg = strjoina("--bus-address=", bus_address);
+
+                execl(broker_path, "systemd1-broker", socket_arg, bus_address_arg, NULL);
+                _exit(EXIT_FAILURE);
+        }
+
+        for (unsigned i = 0; i < 200; i++) {
+                r = is_socket(socket_path);
+                if (r > 0)
+                        break;
+                if (r < 0 && r != -ENOENT)
+                        return r;
+
+                usleep_safe(10 * USEC_PER_MSEC);
+        }
+        ASSERT_OK_POSITIVE(is_socket(socket_path));
+
+        ASSERT_OK(sd_bus_new(&bus));
+        ASSERT_OK(sd_bus_set_address(bus, bus_address));
+        ASSERT_OK(sd_bus_set_bus_client(bus, true));
+        ASSERT_OK(sd_bus_start(bus));
+
+        /* Wait until the broker owns org.freedesktop.systemd1, otherwise dbus-daemon drops the activation
+         * request before anybody can act on it. */
+        for (unsigned i = 0; i < 200; i++) {
+                r = sd_bus_call_method(bus, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", &error, &reply, "s", "org.freedesktop.systemd1");
+                if (r >= 0) {
+                        int has_owner;
+
+                        ASSERT_OK(sd_bus_message_read(reply, "b", &has_owner));
+                        reply = sd_bus_message_unref(reply);
+                        if (has_owner)
+                                break;
+                }
+                sd_bus_error_free(&error);
+
+                usleep_safe(10 * USEC_PER_MSEC);
+        }
+
+        /* Activating the name makes dbus-daemon emit ActivationRequest for probe-activation.service. A
+         * systemd-compatible manager must react by starting that unit. Fire and forget: nothing will ever
+         * own org.probe.Activation here, so waiting for a reply would just burn the bus activation
+         * timeout. */
+        ASSERT_OK(sd_bus_message_new_method_call(bus, &trigger, "org.probe.Activation", "/probe", "org.freedesktop.DBus.Peer", "Ping"));
+        ASSERT_OK(sd_bus_message_set_expect_reply(trigger, false));
+        ASSERT_OK(sd_bus_send(bus, trigger, NULL));
+
+        unit_path = "/org/freedesktop/systemd1/unit/probe_2dactivation_2eservice";
+        for (unsigned i = 0; i < 200; i++) {
+                r = sd_bus_call_method(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "GetUnit", &error, &reply, "s", "probe-activation.service");
+                if (r >= 0) {
+                        const char *path;
+
+                        ASSERT_OK(sd_bus_message_read(reply, "o", &path));
+                        ASSERT_STREQ(path, unit_path);
+                        reply = sd_bus_message_unref(reply);
+                        found_job = true;
+                        break;
+                }
+                sd_bus_error_free(&error);
+
+                usleep_safe(10 * USEC_PER_MSEC);
+        }
+        ASSERT_TRUE(found_job);
+
+        /* An unusable unit name must be reported back as ActivationFailure so dbus-daemon fails the caller
+         * immediately instead of waiting out its activation timeout. */
+        trigger = sd_bus_message_unref(trigger);
+        ASSERT_OK(sd_bus_message_new_method_call(bus, &trigger, "org.probe.Broken", "/probe", "org.freedesktop.DBus.Peer", "Ping"));
+        r = sd_bus_call(bus, trigger, 10 * USEC_PER_SEC, &error, NULL);
+        ASSERT_TRUE(r < 0);
+        ASSERT_STREQ(error.name, SD_BUS_ERROR_INVALID_ARGS);
+        sd_bus_error_free(&error);
+
+        ASSERT_OK(pidref_kill(&broker, SIGTERM));
+        ASSERT_OK(pidref_wait_for_terminate(&broker, &si));
+        ASSERT_EQ(si.si_code, CLD_KILLED);
+        ASSERT_EQ(si.si_status, SIGTERM);
+        pidref_done(&broker);
+
+        ASSERT_OK(pidref_kill(&bus_daemon, SIGTERM));
+        ASSERT_OK(pidref_wait_for_terminate(&bus_daemon, &si));
         pidref_done(&bus_daemon);
 
         return EXIT_SUCCESS;

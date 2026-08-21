@@ -7,6 +7,7 @@
 #include "architecture.h"
 #include "alloc-util.h"
 #include "build.h"
+#include "bus-error.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "log.h"
@@ -427,6 +428,85 @@ static int method_reset_failed_unit(sd_bus_message *message, void *userdata, sd_
                 return reply_no_such_unit(ret_error, name);
 
         return sd_bus_reply_method_return(message, NULL);
+}
+
+static int emit_activation_failure(sd_bus *bus, const char *name, const sd_bus_error *error, int r) {
+        _cleanup_(sd_bus_error_free) sd_bus_error fallback = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+
+        assert(bus);
+        assert(name);
+
+        if (!error || !sd_bus_error_is_set(error)) {
+                sd_bus_error_set_errno(&fallback, r);
+                error = &fallback;
+        }
+
+        r = sd_bus_message_new_signal(
+                        bus,
+                        &reply,
+                        "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Activator",
+                        "ActivationFailure");
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append(reply, "sss", name, error->name, error->message);
+        if (r < 0)
+                return r;
+
+        return sd_bus_send_to(bus, reply, "org.freedesktop.DBus", NULL);
+}
+
+static int signal_activation_request(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        Systemd1BrokerManager *manager = ASSERT_PTR(userdata);
+        Systemd1BrokerJob *job = NULL;
+        sd_bus *bus = ASSERT_PTR(sd_bus_message_get_bus(message));
+        const char *name;
+        int r;
+
+        r = sd_bus_message_read(message, "s", &name);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to parse D-Bus activation request, ignoring: %m");
+                return 0;
+        }
+
+        r = systemd1_broker_manager_start_unit(manager, name, "replace", &job);
+        if (r < 0) {
+                if (r == -ENOENT)
+                        (void) reply_no_such_unit(&error, name);
+                else if (r == -EINVAL)
+                        (void) sd_bus_error_setf(&error, SD_BUS_ERROR_INVALID_ARGS, "Unit name %s is not valid.", name);
+                else
+                        (void) reply_job_error(&error, r);
+
+                log_debug_errno(r, "D-Bus activation failed for %s: %s", name, bus_error_message(&error, r));
+
+                r = emit_activation_failure(bus, name, &error, r);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to respond to D-Bus activation request, ignoring: %m");
+
+                return 0;
+        }
+
+        if (job) {
+                Systemd1BrokerJobInfo info;
+
+                r = systemd1_broker_job_get_info(job, &info);
+                if (r < 0)
+                        return r;
+
+                r = systemd1_broker_dbus_emit_job_new(bus, &info);
+                if (r < 0)
+                        return r;
+
+                r = systemd1_broker_dbus_emit_unit_properties_changed(bus, systemd1_broker_manager_get_unit(manager, name));
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
 }
 
 static int find_unit(sd_bus *bus, const char *path, const char *interface, void *userdata, void **ret_found, sd_bus_error *ret_error) {
@@ -1676,6 +1756,34 @@ int systemd1_broker_dbus_add_manager(sd_bus *bus, Systemd1BrokerManager *manager
                         "org.freedesktop.systemd1.Job",
                         job_vtable,
                         find_job,
+                        manager);
+}
+
+int systemd1_broker_dbus_subscribe_activation(sd_bus *bus, Systemd1BrokerManager *manager) {
+        int r;
+
+        assert(bus);
+        assert(manager);
+
+        /* dbus-daemon started with --systemd-activation hands bus activation over to whoever owns
+         * org.freedesktop.systemd1: it emits Activator.ActivationRequest instead of spawning Exec=. Only
+         * bus-client connections can install server-side matches, and AddMatch needs a started bus, so this
+         * runs after sd_bus_start(). */
+        r = sd_bus_is_bus_client(bus);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 0;
+
+        return sd_bus_match_signal_async(
+                        bus,
+                        NULL,
+                        "org.freedesktop.DBus",
+                        "/org/freedesktop/DBus",
+                        "org.freedesktop.systemd1.Activator",
+                        "ActivationRequest",
+                        signal_activation_request,
+                        NULL,
                         manager);
 }
 

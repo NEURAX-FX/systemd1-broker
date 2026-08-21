@@ -6,6 +6,7 @@
 #include "systemd1-broker.h"
 
 int systemd1_broker_dbus_add_manager(sd_bus *bus, Systemd1BrokerManager *manager);
+int systemd1_broker_dbus_subscribe_activation(sd_bus *bus, Systemd1BrokerManager *manager);
 int systemd1_broker_dbus_emit_job_new(sd_bus *bus, const Systemd1BrokerJobInfo *info);
 int systemd1_broker_dbus_emit_job_removed(sd_bus *bus, const Systemd1BrokerJobInfo *info, const char *result);
 int systemd1_broker_dbus_emit_unit_properties_changed(sd_bus *bus, Systemd1BrokerUnit *unit);
