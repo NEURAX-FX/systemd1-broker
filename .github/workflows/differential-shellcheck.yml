@@ -23,13 +23,13 @@ jobs:
 
     steps:
       - name: Repository checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Differential ShellCheck
-        uses: redhat-plumbers-in-action/differential-shellcheck@d965e66ec0b3b2f821f75c8eff9b12442d9a7d1e
+        uses: redhat-plumbers-in-action/differential-shellcheck@f51c7c0d32777d00de777131d25918617a246415
         with:
           # exclude all `.in` files because they may contain unsupported syntax, and they have to be preprocessed first
           # TEMPORARY: exclude bash completion files, they would generate too many defects in Code scanning dashboard (600+)
